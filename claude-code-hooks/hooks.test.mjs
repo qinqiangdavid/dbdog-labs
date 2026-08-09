@@ -355,9 +355,11 @@ function writeParentTranscript(dir) {
       toolUseResult: {
         agentId: AGENT_ID,
         agentType: "general-purpose",
+        resolvedModel: "claude-opus-5[1m]",
+        status: "completed",
         totalDurationMs: 4000,
-        totalTokens: 14,
-        totalToolUseCount: 1,
+        totalTokens: 20624,
+        totalToolUseCount: 3,
       },
       message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "hi" }] },
     },
@@ -898,5 +900,46 @@ describe("新一轮触发不得丢弃未送达的 pending", () => {
     const second = readState(dir, "c1");
     expect(second.pending_spans).toEqual(["deadbeefdeadbeef"]);
     expect(second.trace_id).not.toBe(first.trace_id); // 确实是新一轮 trace
+  });
+});
+
+describe("父侧 Agent span 带上子代理的聚合开销", () => {
+  it("stamps the parent-side Agent tool span with the subagent's cost tags", () => {
+    // toolUseResult 里现成就有子代理的总开销，不打上去等于白扔——
+    // 有了它们，不展开子树就能看出某个子代理烧了多少 token。
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    seedState(dir, "agg", main);
+
+    runHook(
+      "stop.mjs",
+      { session_id: "agg", transcript_path: main, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+    );
+
+    const agentTool = readSpans(dir).find((s) => s.kind === "tool" && s.name === "Agent");
+    expect(agentTool.tags.agent_id).toBe(AGENT_ID);
+    expect(agentTool.tags.agent_type).toBe("general-purpose");
+    expect(agentTool.tags.agent_model).toBe("claude-opus-5[1m]");
+    expect(agentTool.tags.agent_total_tokens).toBe("20624");
+    expect(agentTool.tags.agent_tool_use_count).toBe("3");
+  });
+
+  it("leaves ordinary tool spans free of agent tags", () => {
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    seedState(dir, "agg2", main);
+
+    runHook(
+      "stop.mjs",
+      { session_id: "agg2", transcript_path: main, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+    );
+
+    // 普通工具的 tool_result 没有 toolUseResult.agentId，不该凭空长出 agent 标
+    for (const s of readSpans(dir).filter((s) => s.kind === "tool" && s.name !== "Agent")) {
+      expect(s.tags.agent_id).toBeUndefined();
+      expect(s.tags.agent_total_tokens).toBeUndefined();
+    }
   });
 });

@@ -176,10 +176,28 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
         // 父侧起子代理的那次调用：span_id 不能随机，必须与 SubagentStop 侧算出同一个值——
         // 子代理的 span 早在这一行落盘之前就写出去了，只能靠 (trace_id, agent_id) 派生对齐。
         // 加 "tool:" 前缀是为了跟子代理自己的 agent span 区分开（两者都由 agent_id 派生）。
-        const subAgentId = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult?.agentId : null;
+        const result = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult : null;
+        const subAgentId = result?.agentId ?? null;
         const spanId = subAgentId
           ? deriveSpanId(traceId, `tool:${subAgentId}`)
           : crypto.randomBytes(8).toString("hex");
+
+        // 子代理的总开销：toolUseResult 里现成就有，不打上去等于白扔——有了它们，
+        // 不展开子树就能看出这个子代理烧了多少。走 tags（字符串）而非 tokens_* 一等
+        // 字段：子代理内部的 llm span 已经各自记了 token，占一等字段会被重复求和。
+        const subAgentTags = subAgentId
+          ? {
+              agent_id: subAgentId,
+              ...(result.agentType ? { agent_type: result.agentType } : {}),
+              ...(result.resolvedModel ? { agent_model: result.resolvedModel } : {}),
+              ...(Number.isFinite(result.totalTokens)
+                ? { agent_total_tokens: String(result.totalTokens) }
+                : {}),
+              ...(Number.isFinite(result.totalToolUseCount)
+                ? { agent_tool_use_count: String(result.totalToolUseCount) }
+                : {}),
+            }
+          : {};
 
         spans.push({
           trace_id: traceId,
@@ -204,6 +222,7 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
             ...(mlApp ? { ml_app: mlApp } : {}),
             ...(use.mcp_server ? { mcp_server: use.mcp_server } : {}),
             ...agentTags,
+            ...subAgentTags,
           },
         });
       }

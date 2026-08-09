@@ -170,6 +170,17 @@ mcp 不双写、不上报，跟没装一样）：
 `agent_id` 的锚点：父侧 tool_result 行的 `toolUseResult.agentId`，与 SubagentStop 入参的
 `agent_id` 一致。子代理的所有 span 带 `tags.sidechain="1"` + `agent_id` + `agent_type`。
 
+父侧 `Agent` tool span 另带子代理的总开销，**不展开子树就能看出它烧了多少**：
+
+| tag | 来源 |
+|-----|------|
+| `agent_total_tokens` | `toolUseResult.totalTokens` |
+| `agent_tool_use_count` | `toolUseResult.totalToolUseCount` |
+| `agent_model` | `toolUseResult.resolvedModel`（子代理实际用的模型，可能与主线不同） |
+
+这几个走 `tags`（字符串）而不是 `tokens_*` 一等字段：子代理内部的 llm span 已经各自
+记了 token，占一等字段会在读侧被重复求和。
+
 **一次模型调用 = 一个 llm span**：transcript 把一次 API 响应按内容块拆成多条 assistant 行
 （requestId 相同、usage 重复），合成器按 requestId 归并——逐行出 span 会虚增轮数 2-3 倍
 （首轮闭环实测坑）。
