@@ -1,11 +1,13 @@
 {
   "name": "dbdog-labs",
-  "owner": { "name": "dbdog" },
+  "owner": {
+    "name": "dbdog"
+  },
   "plugins": [
     {
       "name": "dbdog-agent-obs",
       "source": "./",
-      "description": "dbdog Agent Observability hooks：铸造/传播/合成 trace（UserPromptSubmit + PreToolUse + Stop/SubagentStop），装完即挂全局，配 DBDOG_OBS_* 环境变量即用"
+      "description": "dbdog Agent Observability hooks：铸造/传播/合成 trace + 收尸补发（UserPromptSubmit + PreToolUse + Stop/SubagentStop + SessionStart），子代理内部的工具/模型调用可见（root → Agent → subagent 三层树），装完即挂全局，配 DBDOG_OBS_* 环境变量即用"
     }
   ]
 }

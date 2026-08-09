@@ -20,7 +20,7 @@
 | 4 | 本 kit 的 5 个 hook 进 settings.json | **否 ← 最常缺的就是这步** | 《安装》Step 2–3 | `jq '.hooks \| keys' ~/.claude/settings.json` |
 | 5 | 上报通道（llm/root span 入库用） | 否（不配=只落本地） | 《安装》Step 4 | `curl -s -o /dev/null -w '%{http_code}' -X POST http://<mcp地址>/api/v2/llmobs/spans -H "DD-API-KEY: $DBDOG_OBS_API_KEY" -d '{"spans":[]}'` |
 
-## 分工（mint → propagate → synthesize）
+## 分工（mint → propagate → synthesize → sweep）
 
 | hook | 角色 |
 |------|------|
@@ -71,7 +71,7 @@ jq -e '.hooks | keys' "$S"   # 应含 UserPromptSubmit / PreToolUse / Stop / Sub
 ```
 
 **Step 4 — 配上报通道**（不配也能跑：span 只落本地 JSONL）。dbdog 控制台 **settings → api-keys**
-签发 `dbdog_` 前缀 key，然后把 `Stop`/`SubagentStop` 两处命令里的占位换掉：
+签发 `dbdog_` 前缀 key，然后把 `Stop`/`SubagentStop`/`SessionStart` 三处命令里的占位换掉（sweep 也要上报）：
 
 ```sh
 sed -i.bak \
