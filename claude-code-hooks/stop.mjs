@@ -99,6 +99,10 @@ const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
 function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent }) {
   const spans = [];
   const agentTags = agent ? { agent_id: agent.id, ...(agent.type ? { agent_type: agent.type } : {}) } : {};
+  // 子代理 agent span 的 ts 与 input：实测子代理 transcript 首行即 type=user、
+  // content 为字符串的那条 prompt。
+  let firstEntryTs = null;
+  let firstUserText = null;
 
   // 按 requestId 归并（实测坑，2026-07-09 首轮闭环发现）：一次 API 响应会按内容块拆成
   // 多条 assistant 行——requestId 相同、usage 逐行重复。一次模型调用 = 一个 llm span，
@@ -111,6 +115,11 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
       entry = JSON.parse(line);
     } catch {
       continue; // 容忍脏行
+    }
+
+    if (entry?.timestamp && firstEntryTs == null) firstEntryTs = entry.timestamp;
+    if (firstUserText == null && entry?.type === "user" && typeof entry.message?.content === "string") {
+      firstUserText = entry.message.content;
     }
 
     if (entry?.type === "assistant" && Array.isArray(entry.message?.content)) {
@@ -164,9 +173,10 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
 
         // 父侧起子代理的那次调用：span_id 不能随机，必须与 SubagentStop 侧算出同一个值——
         // 子代理的 span 早在这一行落盘之前就写出去了，只能靠 (trace_id, agent_id) 派生对齐。
+        // 加 "tool:" 前缀是为了跟子代理自己的 agent span 区分开（两者都由 agent_id 派生）。
         const subAgentId = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult?.agentId : null;
         const spanId = subAgentId
-          ? deriveSpanId(traceId, subAgentId)
+          ? deriveSpanId(traceId, `tool:${subAgentId}`)
           : crypto.randomBytes(8).toString("hex");
 
         spans.push({
@@ -237,7 +247,7 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
     });
   }
 
-  return { spans, pendingToolUses, lastEntryTs };
+  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText };
 }
 
 /** 落盘 + 上报；返回未成功上报的批次（留待下次重试）。本地 JSONL 永远先落（真相源）。 */
@@ -261,16 +271,53 @@ async function handleSubagent(input, main) {
 
   const sub = readState(input.session_id, agentId) ?? {};
   const { lines, nextCursor } = readNewLines(transcript, sub.cursor ?? 0);
-  const { spans, pendingToolUses, lastEntryTs } = synthesize({
+
+  // 两个 id 都从 (trace_id, agent_id) 派生，父侧那条加 "tool:" 前缀区分：
+  //   root → [tool] Agent（父视角的调用）→ [agent] 子代理自己 → 子代理的 llm/tool
+  const selfSpanId = deriveSpanId(main.trace_id, agentId);
+  const parentToolSpanId = deriveSpanId(main.trace_id, `tool:${agentId}`);
+
+  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText } = synthesize({
     lines,
     traceId: main.trace_id,
     sessionId: main.session_id ?? input.session_id,
-    parentId: deriveSpanId(main.trace_id, agentId),
+    parentId: selfSpanId,
     mlApp: main.ml_app,
     pendingToolUses: new Map(Object.entries(sub.pending_tool_uses ?? {})),
     lastEntryTs: sub.last_entry_ts ?? null,
     agent: { id: agentId, type: input.agent_type ?? null },
   });
+
+  // 子代理自己的 agent span（一个自治单元 = 一条 agent span，便于按 kind 数出
+  // 这条 trace 用了几个子代理）。同 span_id 可随重入重发，读侧"后写赢"。
+  const startedAt = sub.started_at ?? firstEntryTs;
+  const prompt = sub.prompt ?? firstUserText;
+  if (startedAt) {
+    spans.push({
+      trace_id: main.trace_id,
+      span_id: selfSpanId,
+      parent_id: parentToolSpanId,
+      session_id: main.session_id ?? input.session_id,
+      kind: "agent",
+      name: "claude-code.subagent",
+      model: null,
+      status: "ok",
+      ts: startedAt,
+      duration_ms: msBetween(startedAt, lastEntryTs),
+      input: cap(prompt ?? ""),
+      output: cap(typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
+      tokens_input: null,
+      tokens_output: null,
+      tokens_cache_read: null,
+      tokens_cache_creation: null,
+      tags: {
+        sidechain: "1",
+        agent_id: agentId,
+        ...(input.agent_type ? { agent_type: input.agent_type } : {}),
+        ...(main.ml_app ? { ml_app: main.ml_app } : {}),
+      },
+    });
+  }
 
   const pending = await emit(spans, Array.isArray(sub.pending_spans) ? sub.pending_spans : []);
   writeState(
@@ -279,6 +326,8 @@ async function handleSubagent(input, main) {
       cursor: nextCursor,
       pending_spans: pending,
       last_entry_ts: lastEntryTs,
+      started_at: startedAt ?? null,
+      prompt: prompt ?? null,
       pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
     },
     agentId,

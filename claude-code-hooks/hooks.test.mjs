@@ -295,6 +295,14 @@ const AGENT_ID = "a80d5ea9a276e0a65";
 
 function writeSubagentTranscript(dir) {
   return writeTranscript(dir, "sub.jsonl", [
+    // 实测子代理 transcript 首行即 type=user、content 为字符串的 prompt
+    {
+      type: "user",
+      timestamp: T("01.500"),
+      isSidechain: true,
+      agentId: AGENT_ID,
+      message: { role: "user", content: "跑 echo hi 并把 stdout 报回来" },
+    },
     {
       type: "assistant",
       timestamp: T("02.000"),
@@ -384,7 +392,39 @@ describe("subagent path tracing", () => {
     expect(bash.tags.agent_type).toBe("general-purpose");
   });
 
-  it("parents subagent spans under the parent-side Agent tool span", () => {
+  it("emits an agent span for the subagent itself", () => {
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    const sub = writeSubagentTranscript(dir);
+    seedState(dir, "s7", main);
+
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "s7",
+        transcript_path: main,
+        agent_transcript_path: sub,
+        agent_id: AGENT_ID,
+        agent_type: "general-purpose",
+        hook_event_name: "SubagentStop",
+        last_assistant_message: "stdout 是 hi",
+      },
+      dir,
+    );
+
+    const subAgent = readSpans(dir).find((s) => s.kind === "agent");
+    expect(subAgent, "子代理应有自己的 agent span").toBeDefined();
+    expect(subAgent.name).toBe("claude-code.subagent");
+    expect(subAgent.input).toBe("跑 echo hi 并把 stdout 报回来"); // 子代理 transcript 首行
+    expect(subAgent.output).toBe("stdout 是 hi"); // SubagentStop 的 last_assistant_message
+    expect(subAgent.ts).toBe(T("01.500"));
+    expect(subAgent.duration_ms).toBe(2000); // 首条 → 末条 entry
+    expect(subAgent.tags.sidechain).toBe("1");
+    expect(subAgent.tags.agent_id).toBe(AGENT_ID);
+    expect(subAgent.tags.agent_type).toBe("general-purpose");
+  });
+
+  it("nests three levels: root → parent-side Agent tool → subagent → its own calls", () => {
     const dir = tempObsDir();
     const main = writeParentTranscript(dir);
     const sub = writeSubagentTranscript(dir);
@@ -399,6 +439,7 @@ describe("subagent path tracing", () => {
         agent_id: AGENT_ID,
         agent_type: "general-purpose",
         hook_event_name: "SubagentStop",
+        last_assistant_message: "stdout 是 hi",
       },
       dir,
     );
@@ -409,15 +450,18 @@ describe("subagent path tracing", () => {
     );
 
     const spans = readSpans(dir);
+    const root = spans.find((s) => s.kind === "agent" && s.name === "claude-code.task");
     const agentTool = spans.find((s) => s.kind === "tool" && s.name === "Agent");
+    const subAgent = spans.find((s) => s.kind === "agent" && s.name === "claude-code.subagent");
     const bash = spans.find((s) => s.kind === "tool" && s.name === "Bash");
     const subLlm = spans.find((s) => s.kind === "llm" && s.tags.sidechain === "1");
 
     expect(agentTool, "父侧 Agent 调用应有 tool span").toBeDefined();
-    // 树闭合：子代理的 span 挂在父侧 Agent tool span 下，而不是平铺到 root
-    expect(bash.parent_id).toBe(agentTool.span_id);
-    expect(subLlm.parent_id).toBe(agentTool.span_id);
-    expect(agentTool.parent_id).toBe(spans.find((s) => s.kind === "agent").span_id);
+    expect(agentTool.parent_id).toBe(root.span_id);
+    expect(subAgent.parent_id).toBe(agentTool.span_id);
+    // 子代理内部的调用挂子代理自己的 agent span，不再直接挂父侧 tool span
+    expect(bash.parent_id).toBe(subAgent.span_id);
+    expect(subLlm.parent_id).toBe(subAgent.span_id);
   });
 
   it("stays a no-op when SubagentStop carries no agent_transcript_path", () => {
