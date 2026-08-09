@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -503,3 +504,399 @@ describe("subagent path tracing", () => {
   });
 });
 
+
+// —— 收尸：补发卡死的 pending + 清理过期状态文件（2026-08-09）——
+// 背景：上报失败的 span 存进状态文件的 pending_spans 等下次重试，但 session 结束后
+// 就再没有下一轮触发，永久卡死（实测一台机器积压 737 条从未送达）。
+// sweep.mjs 独立于触发门运行，专门收尸。
+// 并发保险丝：只碰 mtime 足够老的状态文件——那种文件的会话必已结束，没有写者。
+
+/** 起一个真实的 span 接收端，验证补发走通网络路径（而非 mock 掉 reportSpans）。 */
+async function startSpanSink() {
+  const received = [];
+  const batches = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const spans = JSON.parse(body).spans ?? [];
+        batches.push(spans.length);
+        received.push(...spans);
+      } catch {
+        /* 坏 body 计为收到 0 条 */
+      }
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`,
+    received,
+    batches,
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
+/**
+ * 异步跑脚本——必须异步：sweep 会 POST 到本测试进程内起的 sink server，
+ * 用 spawnSync 会阻塞 vitest 的事件循环，server 根本没机会响应，
+ * 每次都得等满 reportSpans 的 3s 超时然后判失败。
+ */
+function runScript(script, obsDir, extraEnv = {}, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(HOOK_DIR, script)], {
+      env: {
+        ...process.env,
+        DBDOG_OBS_DIR: obsDir,
+        DBDOG_OBS_SPANS: path.join(obsDir, "spans.jsonl"),
+        ...extraEnv,
+      },
+    });
+    if (input !== undefined) child.stdin.write(input);
+    child.stdin.end();
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      expect(code, stderr).toBe(0);
+      resolve(stdout);
+    });
+  });
+}
+
+/** 需要 sink 响应的 hook 调用必须走异步版，理由同 runScript。 */
+function runHookAsync(script, input, obsDir, extraEnv = {}) {
+  return runScript(script, obsDir, { DBDOG_OBS_MODE: "triggered", ...extraEnv }, JSON.stringify(input));
+}
+
+/** 把文件 mtime 拨老 ms 毫秒（模拟"会话早已结束"）。 */
+function ageFile(p, ms) {
+  const t = (Date.now() - ms) / 1000;
+  fs.utimesSync(p, t, t);
+}
+
+function writeStateFile(dir, name, state) {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, JSON.stringify(state));
+  return p;
+}
+
+const HOUR = 3600_000;
+const DAY = 24 * HOUR;
+
+describe("sweep: 补发卡死的 pending", () => {
+  it("resends a dead session's pending spans and clears them", async () => {
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      // spans.jsonl 是真相源；状态文件只存 span_id
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        [
+          JSON.stringify({ trace_id: "t1", span_id: "aaaa", kind: "llm", name: "x" }),
+          JSON.stringify({ trace_id: "t1", span_id: "bbbb", kind: "tool", name: "y" }),
+        ].join("\n") + "\n",
+      );
+      const p = writeStateFile(dir, "dead.json", {
+        trace_id: "t1",
+        session_id: "dead",
+        pending_spans: ["aaaa", "bbbb"],
+      });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+      });
+
+      expect(sink.received.map((s) => s.span_id).sort()).toEqual(["aaaa", "bbbb"]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("does not touch a state file that was written recently", async () => {
+    // 并发保险丝：活跃会话的状态文件正有写者，sweep 碰它就会互相覆盖
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        JSON.stringify({ trace_id: "t1", span_id: "aaaa", kind: "llm", name: "x" }) + "\n",
+      );
+      const p = writeStateFile(dir, "live.json", { trace_id: "t1", pending_spans: ["aaaa"] });
+      // 不拨老 mtime = 刚写过
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+      });
+
+      expect(sink.received).toHaveLength(0);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["aaaa"]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("still resends legacy pending_spans that hold full span objects", async () => {
+    // 旧格式：pending_spans 里直接躺着 span 全文（正是状态文件涨到数百 KB 的原因）
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      const p = writeStateFile(dir, "legacy.json", {
+        trace_id: "t1",
+        pending_spans: [{ trace_id: "t1", span_id: "cccc", kind: "llm", name: "old" }],
+      });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+      });
+
+      expect(sink.received.map((s) => s.span_id)).toEqual(["cccc"]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("splits an oversized backlog into batches", async () => {
+    // 服务端限单批 1000 条 / 5MB；实测最大的一个积压文件有 273 条含全文的 span
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      const ids = ["s1", "s2", "s3", "s4", "s5"];
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        ids.map((id) => JSON.stringify({ trace_id: "t", span_id: id, kind: "llm", name: id })).join("\n") + "\n",
+      );
+      const p = writeStateFile(dir, "big.json", { trace_id: "t", pending_spans: ids });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        DBDOG_OBS_SWEEP_BATCH: "2",
+      });
+
+      expect(sink.received.map((s) => s.span_id).sort()).toEqual(ids);
+      expect(sink.batches).toEqual([2, 2, 1]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("keeps pending when the sink rejects, so nothing is lost", async () => {
+    const dir = tempObsDir();
+    fs.writeFileSync(
+      path.join(dir, "spans.jsonl"),
+      JSON.stringify({ trace_id: "t1", span_id: "aaaa", kind: "llm", name: "x" }) + "\n",
+    );
+    const p = writeStateFile(dir, "dead.json", { trace_id: "t1", pending_spans: ["aaaa"] });
+    ageFile(p, 3 * HOUR);
+
+    await runScript("sweep.mjs", dir, {
+      DBDOG_OBS_REPORT_URL: "http://127.0.0.1:1/api/v2/llmobs/spans", // 必然连不上
+      DBDOG_OBS_API_KEY: "k",
+      DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+    });
+
+    expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["aaaa"]);
+    expect(fs.existsSync(p), "上报失败不得删文件").toBe(true);
+  });
+});
+
+describe("sweep: 清理过期状态文件", () => {
+  it("deletes drained files past their TTL and keeps the rest", async () => {
+    const dir = tempObsDir();
+    const expired = writeStateFile(dir, "expired.json", { trace_id: "t", pending_spans: [] });
+    const fresh = writeStateFile(dir, "fresh.json", { trace_id: "t", pending_spans: [] });
+    const stillPending = writeStateFile(dir, "haspending.json", {
+      trace_id: "t",
+      pending_spans: [{ span_id: "zzzz", trace_id: "t", kind: "llm" }],
+    });
+    ageFile(expired, 8 * DAY);
+    ageFile(fresh, 1 * HOUR);
+    ageFile(stillPending, 8 * DAY); // 过期但仍有 pending，且没配上报 → 不许删
+
+    await runScript("sweep.mjs", dir, {
+      DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+      DBDOG_OBS_SWEEP_TTL_MS: String(7 * DAY),
+    });
+
+    expect(fs.existsSync(expired), "已排空且过期 → 删").toBe(false);
+    expect(fs.existsSync(fresh), "未过期 → 留").toBe(true);
+    expect(fs.existsSync(stillPending), "仍有未送达的 span → 留").toBe(true);
+  });
+
+  it("expires subagent state files on a shorter clock", async () => {
+    // 子代理不会复活，排空后没有保留价值；而且并行子代理会一次留下几十个文件
+    const dir = tempObsDir();
+    const sub = writeStateFile(dir, "sess.a80d5ea9a276e0a65.json", { pending_spans: [] });
+    const main = writeStateFile(dir, "sess.json", { trace_id: "t", pending_spans: [] });
+    ageFile(sub, 2 * DAY);
+    ageFile(main, 2 * DAY);
+
+    await runScript("sweep.mjs", dir, {
+      DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+      DBDOG_OBS_SWEEP_TTL_MS: String(7 * DAY),
+      DBDOG_OBS_SWEEP_SUB_TTL_MS: String(1 * DAY),
+    });
+
+    expect(fs.existsSync(sub), "子代理状态文件按短时钟过期 → 删").toBe(false);
+    expect(fs.existsSync(main), "主会话状态文件未到 7 天 → 留").toBe(true);
+  });
+
+  it("never deletes spans.jsonl", async () => {
+    const dir = tempObsDir();
+    const spans = path.join(dir, "spans.jsonl");
+    fs.writeFileSync(spans, JSON.stringify({ span_id: "aaaa", trace_id: "t", kind: "llm" }) + "\n");
+    ageFile(spans, 400 * DAY);
+
+    await runScript("sweep.mjs", dir, { DBDOG_OBS_SWEEP_TTL_MS: String(1000) });
+
+    expect(fs.existsSync(spans), "spans.jsonl 是真相源，永远不能删").toBe(true);
+  });
+});
+
+describe("pending 瘦身：状态文件只存 span_id", () => {
+  /** 一条最小 transcript：一次模型调用 + 一次 Bash，够产出 llm/tool/root 三条 span。 */
+  function tinyTranscript(dir) {
+    return writeTranscript(dir, "tiny.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: x" } },
+      {
+        type: "assistant",
+        timestamp: T("01.000"),
+        requestId: "r1",
+        message: {
+          model: "m",
+          usage: { input_tokens: 1, output_tokens: 1 },
+          content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }],
+        },
+      },
+      {
+        type: "user",
+        timestamp: T("02.000"),
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] },
+      },
+    ]);
+  }
+
+  it("keeps span ids rather than full copies when reporting fails", async () => {
+    // 旧行为把 span 全文塞进状态文件，实测把单个文件撑到 315 KB
+    const dir = tempObsDir();
+    const transcript = tinyTranscript(dir);
+    seedState(dir, "p1", transcript);
+
+    await runHookAsync(
+      "stop.mjs",
+      { session_id: "p1", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+      { DBDOG_OBS_REPORT_URL: "http://127.0.0.1:1/api/v2/llmobs/spans", DBDOG_OBS_API_KEY: "k" },
+    );
+
+    const pending = readState(dir, "p1").pending_spans;
+    expect(pending.length).toBeGreaterThan(0);
+    for (const item of pending) expect(typeof item).toBe("string");
+
+    // 每个 id 都能在 spans.jsonl（真相源）里找回全文
+    const known = new Set(readSpans(dir).map((s) => s.span_id));
+    for (const id of pending) expect(known.has(id)).toBe(true);
+  });
+
+  it("re-sends spans carried over from a previous failed report", async () => {
+    const dir = tempObsDir();
+    const transcript = tinyTranscript(dir);
+    seedState(dir, "p2", transcript);
+
+    // 第一次：上报打不通，span 落本地并记下 id
+    await runHookAsync(
+      "stop.mjs",
+      { session_id: "p2", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+      { DBDOG_OBS_REPORT_URL: "http://127.0.0.1:1/api/v2/llmobs/spans", DBDOG_OBS_API_KEY: "k" },
+    );
+    const carried = readState(dir, "p2").pending_spans;
+    expect(carried.length).toBeGreaterThan(0);
+
+    // 第二次：通了——上一轮攒下的 id 应被回捞成全文一起发出
+    const sink = await startSpanSink();
+    try {
+      await runHookAsync(
+        "stop.mjs",
+        { session_id: "p2", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "done" },
+        dir,
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k" },
+      );
+      const sent = new Set(sink.received.map((s) => s.span_id));
+      for (const id of carried) expect(sent.has(id), `${id} 应被补发`).toBe(true);
+      // 补发的是全文，不是光秃秃的 id
+      expect(sink.received.every((s) => typeof s === "object" && s.kind)).toBe(true);
+      expect(readState(dir, "p2").pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+});
+
+describe("SessionStart 触发后台收尸", () => {
+  async function waitFor(predicate, timeoutMs = 8000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (predicate()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+  }
+
+  it("returns immediately and sweeps in the background", async () => {
+    // 收尸要发好几轮 HTTP，绝不能卡在会话启动路径上——hook 必须立刻返回，
+    // 真正的活交给 detached 子进程慢慢做。
+    const dir = tempObsDir();
+    const expired = writeStateFile(dir, "old.json", { trace_id: "t", pending_spans: [] });
+    ageFile(expired, 8 * DAY);
+
+    const startedAt = Date.now();
+    await runScript(
+      "session-start.mjs",
+      dir,
+      { DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR), DBDOG_OBS_SWEEP_TTL_MS: String(7 * DAY) },
+      JSON.stringify({ session_id: "s", hook_event_name: "SessionStart" }),
+    );
+    expect(Date.now() - startedAt, "hook 本身必须秒回").toBeLessThan(1500);
+
+    expect(await waitFor(() => !fs.existsSync(expired)), "后台 sweep 应清掉过期文件").toBe(true);
+  }, 20000);
+});
+
+describe("新一轮触发不得丢弃未送达的 pending", () => {
+  it("carries unreported pending span ids across a new trigger", () => {
+    // user-prompt-submit 每轮写的是全新 state 对象。若不继承 pending_spans，
+    // "这些 span 没送达"这个事实就此消失，连 sweep 也救不回来——实测有一条 trace
+    // 本地 219 条、服务端只有 110 条，缺的 109 条不在任何状态文件里。
+    const dir = tempObsDir();
+    runHook("user-prompt-submit.mjs", { session_id: "c1", prompt: "诊断: 第一轮", cwd: "/tmp" }, dir);
+
+    const first = readState(dir, "c1");
+    first.pending_spans = ["deadbeefdeadbeef"];
+    fs.writeFileSync(path.join(dir, "c1.json"), JSON.stringify(first));
+
+    runHook("user-prompt-submit.mjs", { session_id: "c1", prompt: "诊断: 第二轮", cwd: "/tmp" }, dir);
+
+    const second = readState(dir, "c1");
+    expect(second.pending_spans).toEqual(["deadbeefdeadbeef"]);
+    expect(second.trace_id).not.toBe(first.trace_id); // 确实是新一轮 trace
+  });
+});

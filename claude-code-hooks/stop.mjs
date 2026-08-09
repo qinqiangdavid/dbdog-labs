@@ -29,6 +29,8 @@ import {
   cap,
   run,
   deriveSpanId,
+  lookupSpans,
+  pendingIds,
 } from "./lib.mjs";
 
 /** 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。 */
@@ -250,12 +252,16 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
   return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText };
 }
 
-/** 落盘 + 上报；返回未成功上报的批次（留待下次重试）。本地 JSONL 永远先落（真相源）。 */
-async function emit(spans, carriedOver) {
+/**
+ * 落盘 + 上报；返回未成功送达的 **span_id 列表**（留待下次重试）。
+ * 本地 JSONL 永远先落（真相源），所以 pending 只需记 id，用时回捞——
+ * 存全文会把状态文件撑到数百 KB（实测 315 KB）。
+ */
+async function emit(spans, carriedOverIds) {
   appendSpans(spans);
-  const batch = [...carriedOver, ...spans];
+  const batch = [...lookupSpans(carriedOverIds), ...spans];
   const reported = await reportSpans(batch);
-  return reported ? [] : batch;
+  return reported ? [] : batch.map((s) => s.span_id);
 }
 
 /**
@@ -319,7 +325,7 @@ async function handleSubagent(input, main) {
     });
   }
 
-  const pending = await emit(spans, Array.isArray(sub.pending_spans) ? sub.pending_spans : []);
+  const pending = await emit(spans, pendingIds(sub.pending_spans));
   writeState(
     input.session_id,
     {
@@ -373,7 +379,7 @@ async function handleMain(input, state) {
   });
   state.root_emitted = true;
 
-  const pending = await emit(spans, Array.isArray(state.pending_spans) ? state.pending_spans : []);
+  const pending = await emit(spans, pendingIds(state.pending_spans));
   state.cursor = nextCursor;
   state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;

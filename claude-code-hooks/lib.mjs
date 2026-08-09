@@ -61,6 +61,44 @@ export function appendSpans(spans) {
 }
 
 /**
+ * span_id → span 全文的索引，读自本地 spans.jsonl（真相源）。
+ * 状态文件里的 pending 只存 span_id、不存副本——旧格式直接塞全文，实测把单个状态
+ * 文件撑到 315 KB（每条 span 的 input/output 上限 8000 字符）。
+ */
+export function spanIndex() {
+  const index = new Map();
+  let text;
+  try {
+    text = fs.readFileSync(spansPath(), "utf8");
+  } catch {
+    return index; // 没有本地 JSONL 就捞不回来
+  }
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    try {
+      const span = JSON.parse(line);
+      if (span?.span_id) index.set(span.span_id, span);
+    } catch {
+      /* 容忍脏行 */
+    }
+  }
+  return index;
+}
+
+/** 按 span_id 捞回全文，保持传入顺序；捞不到的丢弃（本地 JSONL 已被轮转/删除）。 */
+export function lookupSpans(ids) {
+  if (!ids?.length) return [];
+  const index = spanIndex();
+  return ids.map((id) => index.get(id)).filter(Boolean);
+}
+
+/** 兼容两种 pending 格式：新的字符串 id、旧的 span 全文对象。统一成 id 列表。 */
+export function pendingIds(pending) {
+  if (!Array.isArray(pending)) return [];
+  return pending.map((x) => (typeof x === "string" ? x : x?.span_id)).filter(Boolean);
+}
+
+/**
  * 上报 dbdog（Phase C，课题 §5 信道①）：POST 到 mcp 边缘代理（或 server 直连），
  * DD-API-KEY 鉴权（server 侧 key→org 租户路由）。两个 env 齐备才发；短超时、
  * 吞错——本地 JSONL 永远先落（真相源），上报失败不丢数据、不打扰会话。

@@ -1,7 +1,7 @@
 # Claude Code hooks adapter kit（agent 可观测性 · Phase A）
 
 把 Claude Code 从"不进入 Agent Observability"升到"半受控档（全 trace）"的
-三个 hook 脚本。零依赖（node 内建），不改 Claude Code 本体、不嵌 SDK。
+一组 hook 脚本。零依赖（node 内建），不改 Claude Code 本体、不嵌 SDK。
 该目录是可单独分发的 client kit；用户不需要取得或克隆 dbdog-mcp 仓库。
 
 > **默认没有——必须安装**（见下文《安装》，5 步，每步有命令）。
@@ -17,7 +17,7 @@
 | 1 | node ≥ 18（`fetch` 内建） | 通常有 | `brew install node` | `node --version` |
 | 2 | dbdog-mcp server 已在 Claude Code 配置 | 否 | `claude mcp add --transport http dbdog-mcp http://<mcp地址>/mcp` | `claude mcp list` |
 | 3 | mcp 侧 schema 已放行 trace 字段（ADR-0008） | 服务端 ≥2026-07-09 即有 | 升级服务端 | 见《60 秒自检》第 3 步 |
-| 4 | 本 kit 的 4 个 hook 进 settings.json | **否 ← 最常缺的就是这步** | 《安装》Step 2–3 | `jq '.hooks \| keys' ~/.claude/settings.json` |
+| 4 | 本 kit 的 5 个 hook 进 settings.json | **否 ← 最常缺的就是这步** | 《安装》Step 2–3 | `jq '.hooks \| keys' ~/.claude/settings.json` |
 | 5 | 上报通道（llm/root span 入库用） | 否（不配=只落本地） | 《安装》Step 4 | `curl -s -o /dev/null -w '%{http_code}' -X POST http://<mcp地址>/api/v2/llmobs/spans -H "DD-API-KEY: $DBDOG_OBS_API_KEY" -d '{"spans":[]}'` |
 
 ## 分工（mint → propagate → synthesize）
@@ -28,6 +28,8 @@
 | `pre-tool-use.mjs` | **传播**：matcher `mcp__dbdog.*`，出站前经 `updatedInput` 把 `telemetry.trace_id/parent_span_id` 盖上（intent 仍由模型填）；不设 permissionDecision，权限流照常 |
 | `stop.mjs`（Stop） | **合成**：增量读主 transcript，按 requestId 归并出 llm span、按 tool_use/tool_result 配对出 tool span；另出 root agent span（input=用户问题，output=最终回答） |
 | `stop.mjs`（SubagentStop） | **合成子代理**：只读 `agent_transcript_path`（子代理自己那份 transcript），出子代理的 agent span + 其内部的 llm/tool span |
+| `session-start.mjs` | **收尸**：把 `sweep.mjs` 甩到后台（detached）后立刻返回，不占会话启动时间 |
+| `sweep.mjs` | 补发卡死的 pending span + 删过期状态文件。不看触发门，也可手动跑：`node sweep.mjs` |
 
 **tool span 由客户端合成**（2026-07-15 治分叉，ADR-0008 补记）：本地工具（Bash/Read/…）
 与 MCP 工具全覆盖、失败调用也记——transport 断掉的 MCP 调用只有客户端看得见，服务端视角
@@ -41,7 +43,7 @@ dbdog 控制台 `/downloads/client-kit/claude-code-hooks.tar.gz` 下载解包；
 
 ```sh
 KIT=/absolute/path/to/claude-code-hooks   # ← 换成实际绝对路径
-ls "$KIT"/{user-prompt-submit,pre-tool-use,stop}.mjs   # 三个文件都在才继续
+ls "$KIT"/{user-prompt-submit,pre-tool-use,stop,session-start,sweep}.mjs   # 五个文件都在才继续
 ```
 
 **Step 2 — 渲染 settings 片段**（把模板占位路径换成真路径）：
@@ -65,7 +67,7 @@ S=~/.claude/settings.json
 cp "$S" "$S.bak"
 jq --slurpfile snip <(sed "s|/ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks|$KIT|g" "$KIT/settings-snippet.json") \
    '.hooks = ((.hooks // {}) + $snip[0].hooks)' "$S" > "$S.new" && mv "$S.new" "$S"
-jq -e '.hooks | keys' "$S"   # 应含 UserPromptSubmit / PreToolUse / Stop / SubagentStop
+jq -e '.hooks | keys' "$S"   # 应含 UserPromptSubmit / PreToolUse / Stop / SubagentStop / SessionStart
 ```
 
 **Step 4 — 配上报通道**（不配也能跑：span 只落本地 JSONL）。dbdog 控制台 **settings → api-keys**
@@ -107,6 +109,7 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
 - 状态：`~/.claude/dbdog-obs/<session_id>.json`（trace 上下文 + 主 transcript 游标）
 - 子代理状态：`~/.claude/dbdog-obs/<session_id>.<agent_id>.json`（每子代理一份，各写各的——
   并行子代理会同时触发 SubagentStop，共用一个文件必然读-改-写互相覆盖）
+- 状态文件里的 `pending_spans` 只存 span_id，全文回捞自 spans.jsonl（见《收尸机制》）
 - span：`~/.claude/dbdog-obs/spans.jsonl`（每行一个 span，本地真相源永远先落）
 - **上报 dbdog**（Phase C，ADR-0034）：设 `DBDOG_OBS_REPORT_URL`（`http://<dbdog-mcp 地址>/api/v2/llmobs/spans`）
   + `DBDOG_OBS_API_KEY`（控制台 settings/api-keys 签发）后，Stop / SubagentStop 合成的 span 会
@@ -138,7 +141,7 @@ mcp 不双写、不上报，跟没装一样）：
 | 一个 span 都没有 | 消息没带触发词 | 以 `诊断:` 开头重发；或 `DBDOG_OBS_MODE=always` |
 | hook 完全不触发（state 文件不出现） | 会话早于安装 / settings 没合对 | `/hooks` 回车重载或开新会话；`jq -e '.hooks\|keys' ~/.claude/settings.json` |
 | 树里看不到子代理内部的工具调用（只有一条 `Agent` tool span，底下是空的） | 旧版 `stop.mjs` 只读主 transcript，而子代理内容在独立文件里 | 升级到 2026-08-09 之后的 kit（SubagentStop 改读 `agent_transcript_path`） |
-| span 只在本地 `spans.jsonl`，平台上没有 | 上报 env 没配齐（两个都要），或上报失败后卡在 `pending_spans` 里（见《已知缺陷》） | 补 `DBDOG_OBS_REPORT_URL` + `DBDOG_OBS_API_KEY`（安装 Step 4），用前提清单第 5 行的 curl 验证；已卡住的从本地 JSONL 补发 |
+| span 只在本地 `spans.jsonl`，平台上没有 | 上报 env 没配齐（两个都要），或上报失败后卡在 `pending_spans` 里（见《收尸机制》） | 补 `DBDOG_OBS_REPORT_URL` + `DBDOG_OBS_API_KEY`（安装 Step 4），用前提清单第 5 行的 curl 验证；已卡住的跑 `node sweep.mjs` 补发 |
 | span 被服务端拒收（4xx） | 真实拒收原因只有：`trace_id`/`span_id`/`kind` 缺失、`ts` 非 RFC3339、同批 `span_id` 重复、批量超 1000 条或 5MB | 照此自查。**`parent_id` 服务端不做任何校验**，不必等于 `trace_id` 前 16 hex；另注意字段名是 `parent_id`，写成 `parent_span_id` 会被静默丢弃 |
 | settings 里有 `curl → localhost:8126/claude/hooks` 一类 hook | 历史遗留实验，**不属于本 kit**，静默空转 | 删除；本 kit 全链路不经过 8126 |
 
@@ -184,12 +187,36 @@ llm span 的 `input` 置空（每轮完整 prompt = 之前全部对话，逐轮�
   就写在主 transcript 里，Stop 会一并读到，不丢数据。
 - **纪律**：任何错误只写 stderr、exit 0——hook 绝不打断会话（同 `src/telemetry.ts`）。
 
-## 已知缺陷（2026-08-09 实测，待修）
+## 收尸机制（sweep，2026-08-09）
 
-- **上报失败的 span 会永久卡死**：Stop/SubagentStop 上报失败时 span 存进状态文件的
-  `pending_spans` 等下次重试，但如果该 session 再没有下一轮触发（会话结束），就再也没有
-  重试机会。子代理必然中招（结束即无下次）。实测一台机器 35 个状态文件中 5 个有堆积、
-  共 737 条 span 从未送达（本地 spans.jsonl 共 3006 条）。**数据不丢**——本地 JSONL 是
-  真相源，可随时补发；但平台上看不到。
-- **状态文件不清理**：`~/.claude/dbdog-obs/` 下的状态文件只增不删，`pending_spans` 堆积
-  时单个文件可达数百 KB。起过子代理的会话还会各留一份子代理状态文件。
+上报失败的 span 会存进状态文件的 `pending_spans` 等下次重试，但**会话结束后就再没有
+下一轮触发**，从此永久卡死（子代理必然中招，结束即无下次）。实测一台机器 35 个状态
+文件中 5 个有堆积、共 737 条从未送达。`sweep.mjs` 就是来收这个尸的：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `DBDOG_OBS_SWEEP_IDLE_MS` | 2 小时 | 状态文件多久没被写过才算"会话已结束"，可以安全接管 |
+| `DBDOG_OBS_SWEEP_TTL_MS` | 7 天 | 已排空的主会话状态文件保留多久 |
+| `DBDOG_OBS_SWEEP_SUB_TTL_MS` | 1 天 | 子代理状态文件保留多久（不会复活，排空即可删） |
+| `DBDOG_OBS_SWEEP_BATCH` | 200 | 单批补发条数（服务端限 1000 条 / 5MB） |
+
+三条设计要点：
+
+- **靠 mtime 老化避开竞态**：只碰 `IDLE` 之外的文件。那种文件的会话必已结束、没有写者，
+  读改写不需要加锁。活跃会话的状态文件一律不碰。
+- **pending 只存 span_id**：全文回捞自 `spans.jsonl`（真相源）。旧格式存全文，实测把单个
+  状态文件撑到 315 KB。两种格式都兼容。
+- **宁可重发不可丢**：`span_id` 固定，服务端是 `ReplacingMergeTree` + `ORDER BY
+  (trace_id, ts, span_id)`，重复补发会被去重。任何一批失败就整体留着下次再来。
+
+`spans.jsonl` 扩展名是 `.jsonl`，天然不在状态文件（`.json`）的扫描范围内——补发要靠它
+回捞，任何情况下都不得删。
+
+## 已知限制
+
+- **pending 记录本身丢了的救不回来**：2026-08-09 之前的 `user-prompt-submit.mjs` 每轮
+  重建 state 时不继承 `pending_spans`，等于把"这些 span 没送达"的事实一起抹掉。实测有
+  一条 trace 本地 219 条、服务端 110 条，缺的 109 条不在任何状态文件里，sweep 无从下手。
+  该缺陷已修（新一轮触发会继承 pending），但此前丢的记录只能靠人工比对本地 JSONL 补。
+- **`spans.jsonl` 无限增长**：只追加不轮转（实测 9 天 3006 行 / 5.2 MB）。收尸要按 id
+  回捞就更依赖它，不能随便删。轮转策略尚未设计。
