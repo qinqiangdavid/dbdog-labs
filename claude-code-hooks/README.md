@@ -26,11 +26,12 @@
 |------|------|
 | `user-prompt-submit.mjs` | **铸**：一条用户消息 = 一条 trace；铸 trace_id（32 hex）+ root_span_id（前 16 hex 确定性派生），写状态文件 |
 | `pre-tool-use.mjs` | **传播**：matcher `mcp__dbdog.*`，出站前经 `updatedInput` 把 `telemetry.trace_id/parent_span_id` 盖上（intent 仍由模型填）；不设 permissionDecision，权限流照常 |
-| `stop.mjs` | **合成**：增量读 transcript，每条 assistant 消息 → llm span（model/usage/全文，`isSidechain` 标记子代理）；主线 Stop 另出 root agent span（input=用户问题，output=最终回答）。Stop 与 SubagentStop 共用 |
+| `stop.mjs`（Stop） | **合成**：增量读主 transcript，按 requestId 归并出 llm span、按 tool_use/tool_result 配对出 tool span；另出 root agent span（input=用户问题，output=最终回答） |
+| `stop.mjs`（SubagentStop） | **合成子代理**：只读 `agent_transcript_path`（子代理自己那份 transcript），出子代理的 agent span + 其内部的 llm/tool span |
 
-tool span 不在本地合成——mcp 侧 `recordToolCall` 就是它的服务端视角，经注入的 trace_id
-与本地 span 同 trace 归属。**注意（ADR-0008，2026-07-14 收紧）：没有客户端注入的完整
-trace context，服务端不上报 tool span**——所以第 4 项前提不装，连 tool span 都没有。
+**tool span 由客户端合成**（2026-07-15 治分叉，ADR-0008 补记）：本地工具（Bash/Read/…）
+与 MCP 工具全覆盖、失败调用也记——transport 断掉的 MCP 调用只有客户端看得见，服务端视角
+反而是空的。mcp 侧 `recordToolCall` 的服务端双写已退役，不再是 tool span 的来源。
 
 ## 安装（5 步，全带命令）
 
@@ -95,18 +96,22 @@ echo '{"session_id":"selftest","tool_name":"mcp__dbdog-mcp__list_llmobs_projects
 unset DBDOG_OBS_DIR
 
 # 3) 端到端：给 Claude Code 发一条「诊断: 随便问点什么」，跑完后——
-ls ~/.claude/dbdog-obs/                 # 应出现 <session_id>.json
-tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"llm" 的行
-# LLM Obs UI 按 ml_app:<目录名> 过滤 traces，应看到完整树（root → llm/tool span）
+ls ~/.claude/dbdog-obs/                 # 应出现 <session_id>.json（用过子代理还会有 <session_id>.<agent_id>.json）
+tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"llm"/"tool" 的行
+# LLM Obs UI 按 ml_app:<目录名> 过滤 traces，应看到完整树
+# （起过子代理的话是三层：root → [tool] Agent → [agent] claude-code.subagent → 子代理的 llm/tool）
 ```
 
 ## 产物与配置
 
-- 状态：`~/.claude/dbdog-obs/<session_id>.json`（trace 上下文 + transcript 游标）
+- 状态：`~/.claude/dbdog-obs/<session_id>.json`（trace 上下文 + 主 transcript 游标）
+- 子代理状态：`~/.claude/dbdog-obs/<session_id>.<agent_id>.json`（每子代理一份，各写各的——
+  并行子代理会同时触发 SubagentStop，共用一个文件必然读-改-写互相覆盖）
 - span：`~/.claude/dbdog-obs/spans.jsonl`（每行一个 span，本地真相源永远先落）
 - **上报 dbdog**（Phase C，ADR-0034）：设 `DBDOG_OBS_REPORT_URL`（`http://<dbdog-mcp 地址>/api/v2/llmobs/spans`）
-  + `DBDOG_OBS_API_KEY`（控制台 settings/api-keys 签发）后，Stop 合成的 span 会 best-effort
-  从 MCP 边缘口 POST 入库；未设两 env = 只落本地，行为与 Phase A 相同
+  + `DBDOG_OBS_API_KEY`（控制台 settings/api-keys 签发）后，Stop / SubagentStop 合成的 span 会
+  best-effort 从 MCP 边缘口 POST 入库；未设两 env = 只落本地，行为与 Phase A 相同。
+  **注意这个 URL 是 mcp 边缘口，只收 `POST /spans`；查 trace 要走 dbdog-server 本体**
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
   `DBDOG_OBS_CONTENT_CHARS`（内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS` 先例）、
   `DBDOG_OBS_ML_APP`（应用名标签，打进 root/llm span 的 `tags.ml_app`；缺省 = 项目目录名。
@@ -132,24 +137,59 @@ mcp 不双写、不上报，跟没装一样）：
 |------|-----------|------|
 | 一个 span 都没有 | 消息没带触发词 | 以 `诊断:` 开头重发；或 `DBDOG_OBS_MODE=always` |
 | hook 完全不触发（state 文件不出现） | 会话早于安装 / settings 没合对 | `/hooks` 回车重载或开新会话；`jq -e '.hooks\|keys' ~/.claude/settings.json` |
-| 只有 llm/root span，没有 tool span | mcp 会话失效（`no valid session; expected an initialize request first`）或旧版 mcp 剥掉了 trace 字段 | Claude Code 里 `/mcp` → reconnect（客户端不会自动重连）；确认服务端 ≥ ADR-0008 |
-| tool span 有，llm/root span 只在本地 `spans.jsonl` | 上报 env 没配齐（两个都要） | 补 `DBDOG_OBS_REPORT_URL` + `DBDOG_OBS_API_KEY`（安装 Step 4），用前提清单第 5 行的 curl 验证 |
-| 自写注入器，span 被服务端拒收 | `parent_span_id` 不合派生约定 | 必须 = `trace_id` 前 16 hex；建议直接用本 kit 的 `pre-tool-use.mjs` |
+| 树里看不到子代理内部的工具调用（只有一条 `Agent` tool span，底下是空的） | 旧版 `stop.mjs` 只读主 transcript，而子代理内容在独立文件里 | 升级到 2026-08-09 之后的 kit（SubagentStop 改读 `agent_transcript_path`） |
+| span 只在本地 `spans.jsonl`，平台上没有 | 上报 env 没配齐（两个都要），或上报失败后卡在 `pending_spans` 里（见《已知缺陷》） | 补 `DBDOG_OBS_REPORT_URL` + `DBDOG_OBS_API_KEY`（安装 Step 4），用前提清单第 5 行的 curl 验证；已卡住的从本地 JSONL 补发 |
+| span 被服务端拒收（4xx） | 真实拒收原因只有：`trace_id`/`span_id`/`kind` 缺失、`ts` 非 RFC3339、同批 `span_id` 重复、批量超 1000 条或 5MB | 照此自查。**`parent_id` 服务端不做任何校验**，不必等于 `trace_id` 前 16 hex；另注意字段名是 `parent_id`，写成 `parent_span_id` 会被静默丢弃 |
 | settings 里有 `curl → localhost:8126/claude/hooks` 一类 hook | 历史遗留实验，**不属于本 kit**，静默空转 | 删除；本 kit 全链路不经过 8126 |
 
-## span 形状（v1 平铺树）
+## span 形状（v2 三层树，2026-08-09）
 
-所有 llm span 的 `parent_id` = root_span_id（DD llmobs agent trace 常见形状），
-tool↔llm 邻接靠时间戳；深嵌套留待后续（transcript 的 tool_use 块足以重建，不丢信息）。
+主线的 llm/tool span 仍平挂 root；起了子代理才有嵌套：
+
+```
+[agent] claude-code.task                 root_span_id = trace_id 前 16 hex
+├─ [llm] anthropic.messages
+├─ [tool] Bash
+└─ [tool] Agent                          父视角的调用（耗时/入参/结果）
+   └─ [agent] claude-code.subagent       子代理自身（input=子代理 prompt、output=其最终产出）
+      ├─ [llm] anthropic.messages
+      └─ [tool] Bash
+```
+
+**父子挂载靠确定性派生，两侧不通信**——SubagentStop 触发时，父侧那行 tool_result 还没落盘，
+当场拿不到父 span_id，只能各自算：
+
+| span | span_id |
+|------|---------|
+| 父侧 `Agent` tool span | `sha256(trace_id + ":tool:" + agent_id)[:16]` |
+| 子代理 `agent` span | `sha256(trace_id + ":" + agent_id)[:16]` |
+
+`agent_id` 的锚点：父侧 tool_result 行的 `toolUseResult.agentId`，与 SubagentStop 入参的
+`agent_id` 一致。子代理的所有 span 带 `tags.sidechain="1"` + `agent_id` + `agent_type`。
+
 **一次模型调用 = 一个 llm span**：transcript 把一次 API 响应按内容块拆成多条 assistant 行
 （requestId 相同、usage 重复），合成器按 requestId 归并——逐行出 span 会虚增轮数 2-3 倍
 （首轮闭环实测坑）。
 llm span 的 `input` 置空（每轮完整 prompt = 之前全部对话，逐轮重复入盘不划算）；
-任务级 in/out 在 root span。`duration_ms` 单轮不可得（transcript 只有落盘时刻），如实置空。
+任务级 in/out 在 root span，子代理级在其 agent span。`duration_ms` 是近似值
+（前一条 entry 落盘 → 组内末行落盘），打 `duration_estimated` 标区分。
 
 ## 已知语义（读侧须知）
 
 - **root span 会重发**：同一 trace 多次 Stop（如用户中断后继续）时 root 以同 span_id
-  重新追加（output/duration 刷新）——读侧按 span_id"后写赢"去重。
+  重新追加（output/duration 刷新）——读侧按 span_id"后写赢"去重。子代理的 agent span
+  同理（SubagentStop 重入时同 span_id 重发）。
 - **hook 装好前已开的会话**：无状态文件 → 全部 hook 静默放行，不产 span。
+- **老版 Claude Code**：SubagentStop 不带 `agent_transcript_path` 时静默空转——那时子代理内容
+  就写在主 transcript 里，Stop 会一并读到，不丢数据。
 - **纪律**：任何错误只写 stderr、exit 0——hook 绝不打断会话（同 `src/telemetry.ts`）。
+
+## 已知缺陷（2026-08-09 实测，待修）
+
+- **上报失败的 span 会永久卡死**：Stop/SubagentStop 上报失败时 span 存进状态文件的
+  `pending_spans` 等下次重试，但如果该 session 再没有下一轮触发（会话结束），就再也没有
+  重试机会。子代理必然中招（结束即无下次）。实测一台机器 35 个状态文件中 5 个有堆积、
+  共 737 条 span 从未送达（本地 spans.jsonl 共 3006 条）。**数据不丢**——本地 JSONL 是
+  真相源，可随时补发；但平台上看不到。
+- **状态文件不清理**：`~/.claude/dbdog-obs/` 下的状态文件只增不删，`pending_spans` 堆积
+  时单个文件可达数百 KB。起过子代理的会话还会各留一份子代理状态文件。
