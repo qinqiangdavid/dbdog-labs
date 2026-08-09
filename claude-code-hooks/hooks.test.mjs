@@ -270,16 +270,192 @@ describe("Stop hook span synthesis", () => {
     const transcript = writeTranscript(dir, "t.jsonl", [use]);
     seedState(dir, "s2", transcript);
 
-    runHook("stop.mjs", { session_id: "s2", transcript_path: transcript, hook_event_name: "SubagentStop" }, dir);
+    runHook("stop.mjs", { session_id: "s2", transcript_path: transcript, hook_event_name: "Stop" }, dir);
     expect(readSpans(dir).filter((s) => s.kind === "tool")).toHaveLength(0);
     expect(Object.keys(readState(dir, "s2").pending_tool_uses)).toEqual(["tu_x"]);
 
     fs.appendFileSync(transcript, JSON.stringify(result) + "\n");
-    runHook("stop.mjs", { session_id: "s2", transcript_path: transcript, hook_event_name: "SubagentStop" }, dir);
+    runHook("stop.mjs", { session_id: "s2", transcript_path: transcript, hook_event_name: "Stop" }, dir);
     const tool = readSpans(dir).find((s) => s.kind === "tool");
     expect(tool.name).toBe("Read");
     expect(tool.duration_ms).toBe(3000);
     expect(tool.status).toBe("ok");
+  });
+});
+
+// —— 子代理路径追踪（2026-08-09）——
+// 上游 Claude Code 2.1.x 把子代理会话流水拆成独立文件 <session>/subagents/agent-<id>.jsonl，
+// 主 transcript 里不再有 isSidechain 行。SubagentStop 实测入参：
+//   transcript_path        = 主 transcript（与 Stop 相同）
+//   agent_transcript_path  = 子代理那份
+//   agent_id / agent_type  = 子代理身份
+// 父子关联锚点：父侧 Agent 工具的 tool_result 行带 toolUseResult.agentId，与 agent_id 精确对上。
+
+const AGENT_ID = "a80d5ea9a276e0a65";
+
+function writeSubagentTranscript(dir) {
+  return writeTranscript(dir, "sub.jsonl", [
+    {
+      type: "assistant",
+      timestamp: T("02.000"),
+      requestId: "req_sub",
+      isSidechain: true,
+      agentId: AGENT_ID,
+      message: {
+        model: "claude-opus-5",
+        usage: { input_tokens: 5, output_tokens: 9 },
+        content: [
+          { type: "text", text: "先跑一下" },
+          { type: "tool_use", id: "tu_sub", name: "Bash", input: { command: "echo hi" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      timestamp: T("03.500"),
+      isSidechain: true,
+      agentId: AGENT_ID,
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_sub", content: "hi" }] },
+    },
+  ]);
+}
+
+function writeParentTranscript(dir) {
+  return writeTranscript(dir, "main.jsonl", [
+    { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 起个子代理" } },
+    {
+      type: "assistant",
+      timestamp: T("01.000"),
+      requestId: "req_main",
+      message: {
+        model: "claude-opus-5",
+        usage: { input_tokens: 1, output_tokens: 2 },
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_agent",
+            name: "Agent",
+            input: { subagent_type: "general-purpose", prompt: "跑 echo" },
+          },
+        ],
+      },
+    },
+    {
+      type: "user",
+      timestamp: T("05.000"),
+      toolUseResult: {
+        agentId: AGENT_ID,
+        agentType: "general-purpose",
+        totalDurationMs: 4000,
+        totalTokens: 14,
+        totalToolUseCount: 1,
+      },
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "hi" }] },
+    },
+  ]);
+}
+
+describe("subagent path tracing", () => {
+  it("synthesizes the subagent's own tool spans from agent_transcript_path", () => {
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    const sub = writeSubagentTranscript(dir);
+    seedState(dir, "s3", main);
+
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "s3",
+        transcript_path: main,
+        agent_transcript_path: sub,
+        agent_id: AGENT_ID,
+        agent_type: "general-purpose",
+        hook_event_name: "SubagentStop",
+      },
+      dir,
+    );
+
+    const bash = readSpans(dir).find((s) => s.kind === "tool" && s.name === "Bash");
+    expect(bash, "子代理内部的 Bash 调用应合成 tool span").toBeDefined();
+    expect(bash.output).toBe("hi");
+    expect(bash.duration_ms).toBe(1500);
+    expect(bash.tags.sidechain).toBe("1");
+    expect(bash.tags.agent_id).toBe(AGENT_ID);
+    expect(bash.tags.agent_type).toBe("general-purpose");
+  });
+
+  it("parents subagent spans under the parent-side Agent tool span", () => {
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    const sub = writeSubagentTranscript(dir);
+    seedState(dir, "s4", main);
+
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "s4",
+        transcript_path: main,
+        agent_transcript_path: sub,
+        agent_id: AGENT_ID,
+        agent_type: "general-purpose",
+        hook_event_name: "SubagentStop",
+      },
+      dir,
+    );
+    runHook(
+      "stop.mjs",
+      { session_id: "s4", transcript_path: main, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+    );
+
+    const spans = readSpans(dir);
+    const agentTool = spans.find((s) => s.kind === "tool" && s.name === "Agent");
+    const bash = spans.find((s) => s.kind === "tool" && s.name === "Bash");
+    const subLlm = spans.find((s) => s.kind === "llm" && s.tags.sidechain === "1");
+
+    expect(agentTool, "父侧 Agent 调用应有 tool span").toBeDefined();
+    // 树闭合：子代理的 span 挂在父侧 Agent tool span 下，而不是平铺到 root
+    expect(bash.parent_id).toBe(agentTool.span_id);
+    expect(subLlm.parent_id).toBe(agentTool.span_id);
+    expect(agentTool.parent_id).toBe(spans.find((s) => s.kind === "agent").span_id);
+  });
+
+  it("stays a no-op when SubagentStop carries no agent_transcript_path", () => {
+    // 老版 Claude Code 不给 agent_transcript_path（那会儿子代理内容就写在主 transcript 里，
+    // Stop 一并读得到）。此时必须原地不动——尤其不能去读主 transcript、推主游标。
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    seedState(dir, "s6", main);
+
+    runHook("stop.mjs", { session_id: "s6", transcript_path: main, hook_event_name: "SubagentStop" }, dir);
+
+    expect(fs.existsSync(path.join(dir, "spans.jsonl"))).toBe(false);
+    expect(readState(dir, "s6").cursor).toBe(0);
+  });
+
+  it("leaves the main transcript cursor untouched on SubagentStop", () => {
+    // 并发安全：并行子代理会同时触发 SubagentStop，若各自读-改-写主 state，
+    // 后写覆盖先写 → 主游标错乱。SubagentStop 只该碰子代理那份。
+    const dir = tempObsDir();
+    const main = writeParentTranscript(dir);
+    const sub = writeSubagentTranscript(dir);
+    seedState(dir, "s5", main);
+    const before = readState(dir, "s5").cursor;
+
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "s5",
+        transcript_path: main,
+        agent_transcript_path: sub,
+        agent_id: AGENT_ID,
+        agent_type: "general-purpose",
+        hook_event_name: "SubagentStop",
+      },
+      dir,
+    );
+
+    expect(readState(dir, "s5").cursor).toBe(before);
   });
 });
 

@@ -6,11 +6,30 @@
 //   Claude Code 官方 OTel 遥测 claude_code.tool 即客户端产出全部工具 span。
 //   2026-07-15 治分叉：tool span 从 mcp 服务端双写挪回此处，ADR-0008 补记）；
 // - Stop 时另合成/刷新 root agent span（input=用户问题、output=最终回答）。
-// v1 平铺树：llm/tool span 的 parent 一律 = root（课题 §3）。
+//
+// 2026-08-09 子代理路径追踪：上游 Claude Code 2.1.x 把子代理会话流水拆成了独立文件
+// <session>/subagents/agent-<agent_id>.jsonl，主 transcript 里不再有 isSidechain 行。
+// SubagentStop 的 transcript_path 仍是主 transcript（与 Stop 相同），子代理那份在
+// agent_transcript_path 字段里——此前从没读过它，于是子代理内部的一切工具调用都不可见。
+// 现在两条路径分开走：Stop 读主 transcript，SubagentStop 只读 agent_transcript_path。
+//
+// 树形（v1 平铺已升级为两层）：
+//   root agent span
+//   └─ tool span "Agent"        父侧调用，span_id = derive(trace_id, agent_id)
+//      └─ 子代理的 llm/tool span  parent_id = 同一个派生值
 // 输出追加到 spans.jsonl。root span 可能随多次 Stop 重发（同 span_id），读侧按"后写赢"去重。
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { readStdinJson, readState, writeState, appendSpans, reportSpans, cap, run } from "./lib.mjs";
+import {
+  readStdinJson,
+  readState,
+  writeState,
+  appendSpans,
+  reportSpans,
+  cap,
+  run,
+  deriveSpanId,
+} from "./lib.mjs";
 
 /** 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。 */
 function readNewLines(file, cursor) {
@@ -65,21 +84,21 @@ function msBetween(fromIso, toIso) {
 /** 未配对 tool_use 跨批携带上限（state 文件防膨胀；超限丢最旧）。 */
 const PENDING_TOOL_USE_MAX = 200;
 
-run(async () => {
-  const input = await readStdinJson();
-  const state = readState(input.session_id);
-  const transcript = input.transcript_path ?? state?.transcript_path;
-  // 无 trace 归属或本轮未触发（DBDOG_OBS_MODE 触发门）→ 不产 span、不上报
-  if (!state?.trace_id || state.active === false || !transcript) return;
+/** 起子代理的工具名（父侧那一次调用，其 tool_result 携带 toolUseResult.agentId）。 */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
 
-  const { lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0);
-  const pendingSpans = Array.isArray(state.pending_spans) ? state.pending_spans : [];
+/**
+ * 从 transcript 新增行合成 llm + tool span。
+ * 主会话与子代理共用这一套：实测子代理那份 transcript 与主 transcript 完全同构
+ * （requestId / message.usage / model / tool_use / tool_result 齐全），差别只是
+ * isSidechain=true 且多了 agentId。
+ *
+ * @param parentId  本批 span 挂的父节点（主线=root span；子代理=父侧 Agent tool span 的派生 id）
+ * @param agent     非空表示正在处理子代理那份 transcript，span 上补 agent_id/agent_type
+ */
+function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent }) {
   const spans = [];
-
-  // 跨批状态：未配对的 tool_use（tool_result 可能落在下一批）+ 上一条 entry 的时间戳
-  // （llm 时长近似的起点）。
-  const pendingToolUses = new Map(Object.entries(state.pending_tool_uses ?? {}));
-  let lastEntryTs = state.last_entry_ts ?? null;
+  const agentTags = agent ? { agent_id: agent.id, ...(agent.type ? { agent_type: agent.type } : {}) } : {};
 
   // 按 requestId 归并（实测坑，2026-07-09 首轮闭环发现）：一次 API 响应会按内容块拆成
   // 多条 assistant 行——requestId 相同、usage 逐行重复。一次模型调用 = 一个 llm span，
@@ -118,7 +137,7 @@ run(async () => {
           intent,
           input: inputJson,
           ts: entry.timestamp ?? null,
-          sidechain: entry.isSidechain ? "1" : "0",
+          sidechain: agent || entry.isSidechain ? "1" : "0",
         });
       }
 
@@ -142,11 +161,19 @@ run(async () => {
         const use = pendingToolUses.get(b.tool_use_id);
         if (!use) continue;
         pendingToolUses.delete(b.tool_use_id);
+
+        // 父侧起子代理的那次调用：span_id 不能随机，必须与 SubagentStop 侧算出同一个值——
+        // 子代理的 span 早在这一行落盘之前就写出去了，只能靠 (trace_id, agent_id) 派生对齐。
+        const subAgentId = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult?.agentId : null;
+        const spanId = subAgentId
+          ? deriveSpanId(traceId, subAgentId)
+          : crypto.randomBytes(8).toString("hex");
+
         spans.push({
-          trace_id: state.trace_id,
-          span_id: crypto.randomBytes(8).toString("hex"),
-          parent_id: state.root_span_id,
-          session_id: state.session_id,
+          trace_id: traceId,
+          span_id: spanId,
+          parent_id: parentId,
+          session_id: sessionId,
           kind: "tool",
           name: use.name,
           model: null,
@@ -162,8 +189,9 @@ run(async () => {
           tokens_cache_creation: null,
           tags: {
             sidechain: use.sidechain,
-            ...(state.ml_app ? { ml_app: state.ml_app } : {}),
+            ...(mlApp ? { ml_app: mlApp } : {}),
             ...(use.mcp_server ? { mcp_server: use.mcp_server } : {}),
+            ...agentTags,
           },
         });
       }
@@ -182,10 +210,10 @@ run(async () => {
     // span 终点会越过 root 终点（0.2.0 实测 39s 过冲）。
     const duration = msBetween(g.startTs, last.timestamp);
     spans.push({
-      trace_id: state.trace_id,
+      trace_id: traceId,
       span_id: crypto.randomBytes(8).toString("hex"),
-      parent_id: state.root_span_id,
-      session_id: state.session_id,
+      parent_id: parentId,
+      session_id: sessionId,
       kind: "llm",
       name: "anthropic.messages",
       model: msg.model ?? null,
@@ -199,47 +227,119 @@ run(async () => {
       tokens_cache_read: msg.usage.cache_read_input_tokens ?? null,
       tokens_cache_creation: msg.usage.cache_creation_input_tokens ?? null,
       tags: {
-        sidechain: first.isSidechain ? "1" : "0",
+        sidechain: agent || first.isSidechain ? "1" : "0",
         ...(duration != null ? { duration_estimated: "1" } : {}),
-        ...(state.ml_app ? { ml_app: state.ml_app } : {}),
+        ...(mlApp ? { ml_app: mlApp } : {}),
         ...(first.requestId ? { request_id: first.requestId } : {}),
         ...(msg.stop_reason ? { stop_reason: msg.stop_reason } : {}),
+        ...agentTags,
       },
     });
   }
 
-  // root agent span：主线 Stop 时（不在 SubagentStop）合成/刷新——同 span_id 重发，后写赢。
-  if (input.hook_event_name === "Stop") {
-    spans.push({
-      trace_id: state.trace_id,
-      span_id: state.root_span_id,
-      parent_id: null,
-      session_id: state.session_id,
-      kind: "agent",
-      name: "claude-code.task",
-      model: null,
-      status: "ok",
-      ts: state.started_at,
-      duration_ms: state.started_at ? Date.now() - Date.parse(state.started_at) : null,
-      input: cap(state.prompt ?? ""),
-      output: cap(typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
-      tokens_input: null,
-      tokens_output: null,
-      tokens_cache_read: null,
-      tokens_cache_creation: null,
-      tags: { trace_source: "client", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
-    });
-    state.root_emitted = true;
-  }
+  return { spans, pendingToolUses, lastEntryTs };
+}
 
-  appendSpans(spans); // 本地 JSONL 先落（真相源）
-  const reportBatch = [...pendingSpans, ...spans];
-  const reported = await reportSpans(reportBatch); // HTTP 非 2xx 也视为失败，留待下次重试
+/** 落盘 + 上报；返回未成功上报的批次（留待下次重试）。本地 JSONL 永远先落（真相源）。 */
+async function emit(spans, carriedOver) {
+  appendSpans(spans);
+  const batch = [...carriedOver, ...spans];
+  const reported = await reportSpans(batch);
+  return reported ? [] : batch;
+}
+
+/**
+ * SubagentStop：只读 agent_transcript_path，只写该子代理自己的状态文件。
+ * 主 state 一律只读不写——并行子代理会同时触发本分支，碰主 state 必然互相覆盖。
+ */
+async function handleSubagent(input, main) {
+  const agentId = input.agent_id;
+  const transcript = input.agent_transcript_path;
+  // 老版 Claude Code 不给这两个字段（那会儿子代理内容就写在主 transcript 里，
+  // Stop 一并读得到）——静默跳过，别去动主 state。
+  if (!agentId || !transcript) return;
+
+  const sub = readState(input.session_id, agentId) ?? {};
+  const { lines, nextCursor } = readNewLines(transcript, sub.cursor ?? 0);
+  const { spans, pendingToolUses, lastEntryTs } = synthesize({
+    lines,
+    traceId: main.trace_id,
+    sessionId: main.session_id ?? input.session_id,
+    parentId: deriveSpanId(main.trace_id, agentId),
+    mlApp: main.ml_app,
+    pendingToolUses: new Map(Object.entries(sub.pending_tool_uses ?? {})),
+    lastEntryTs: sub.last_entry_ts ?? null,
+    agent: { id: agentId, type: input.agent_type ?? null },
+  });
+
+  const pending = await emit(spans, Array.isArray(sub.pending_spans) ? sub.pending_spans : []);
+  writeState(
+    input.session_id,
+    {
+      cursor: nextCursor,
+      pending_spans: pending,
+      last_entry_ts: lastEntryTs,
+      pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
+    },
+    agentId,
+  );
+}
+
+/** Stop：读主 transcript，合成本轮 llm/tool span，并合成/刷新 root agent span。 */
+async function handleMain(input, state) {
+  const transcript = input.transcript_path ?? state.transcript_path;
+  if (!transcript) return;
+
+  const { lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0);
+  const { spans, pendingToolUses, lastEntryTs } = synthesize({
+    lines,
+    traceId: state.trace_id,
+    sessionId: state.session_id,
+    parentId: state.root_span_id,
+    mlApp: state.ml_app,
+    pendingToolUses: new Map(Object.entries(state.pending_tool_uses ?? {})),
+    lastEntryTs: state.last_entry_ts ?? null,
+    agent: null,
+  });
+
+  // root agent span：同 span_id 重发，后写赢。
+  spans.push({
+    trace_id: state.trace_id,
+    span_id: state.root_span_id,
+    parent_id: null,
+    session_id: state.session_id,
+    kind: "agent",
+    name: "claude-code.task",
+    model: null,
+    status: "ok",
+    ts: state.started_at,
+    duration_ms: state.started_at ? Date.now() - Date.parse(state.started_at) : null,
+    input: cap(state.prompt ?? ""),
+    output: cap(typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
+    tokens_input: null,
+    tokens_output: null,
+    tokens_cache_read: null,
+    tokens_cache_creation: null,
+    tags: { trace_source: "client", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
+  });
+  state.root_emitted = true;
+
+  const pending = await emit(spans, Array.isArray(state.pending_spans) ? state.pending_spans : []);
   state.cursor = nextCursor;
-  state.pending_spans = reported ? [] : reportBatch;
+  state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
   state.pending_tool_uses = Object.fromEntries(
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),
   );
   writeState(input.session_id, state);
+}
+
+run(async () => {
+  const input = await readStdinJson();
+  const state = readState(input.session_id);
+  // 无 trace 归属或本轮未触发（DBDOG_OBS_MODE 触发门）→ 不产 span、不上报
+  if (!state?.trace_id || state.active === false) return;
+
+  if (input.hook_event_name === "SubagentStop") await handleSubagent(input, state);
+  else await handleMain(input, state);
 });
