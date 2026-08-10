@@ -115,7 +115,9 @@ export async function reportSpans(spans) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", "DD-API-KEY": key },
-      body: JSON.stringify({ spans }),
+      // input_local（每轮完整 prompt，见 stop.mjs）是纯本地字段：远端只看树形与 token，
+      // 不推全文。pending 重发捞回本地 JSONL 的 span 同样带该字段，在这里一并剥掉。
+      body: JSON.stringify({ spans: spans.map(({ input_local, ...rest }) => rest) }),
       signal: AbortSignal.timeout(3000),
     });
     return response.ok;
@@ -129,6 +131,25 @@ export async function reportSpans(spans) {
 export function contentCap() {
   const n = Number(process.env.DBDOG_OBS_CONTENT_CHARS ?? "");
   return Number.isFinite(n) && n > 0 ? n : 8000;
+}
+
+/**
+ * llm span 的每轮完整 prompt 是否落本地 JSONL（默认开；DBDOG_OBS_STORE_LLM_INPUT=0/off 关）。
+ * 只进 spans.jsonl——reportSpans 上报前剥离，远端 schema 不动、带宽不浪费。
+ * 目的：复盘"这个子代理/主线每轮到底看到了什么"，定位上下文膨胀与 token 去向。
+ */
+export function storeLlmInput() {
+  const v = (process.env.DBDOG_OBS_STORE_LLM_INPUT ?? "1").trim().toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+
+/**
+ * 上下文滚动缓冲上限（字符，默认 200K ≈ 5 万 token 的尾部上下文）。每轮 prompt 从它截尾，
+ * 同时防止状态文件随对话无限膨胀。调大只影响本地占盘，不影响上报。
+ */
+export function ctxBufCap() {
+  const n = Number(process.env.DBDOG_OBS_CTX_BUF_CHARS ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 200000;
 }
 
 export function cap(s) {

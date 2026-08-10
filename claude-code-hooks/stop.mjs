@@ -27,6 +27,9 @@ import {
   appendSpans,
   reportSpans,
   cap,
+  contentCap,
+  storeLlmInput,
+  ctxBufCap,
   run,
   deriveSpanId,
   lookupSpans,
@@ -75,6 +78,14 @@ function toolResultText(content) {
   }
 }
 
+/** 截尾版 cap：每轮 prompt 的诊断价值在"新注入的尾部"（上下文为什么膨胀看的就是它），
+ *  取后 contentCap 字符；头部（系统提示/初始 prompt）由 root/agent span 的 input 覆盖。 */
+function capTail(s) {
+  if (typeof s !== "string") return null;
+  const c = contentCap();
+  return s.length > c ? s.slice(-c) : s;
+}
+
 /** 两个 ISO 时间戳的毫秒差；不可算（缺值/乱序）→ null。 */
 function msBetween(fromIso, toIso) {
   const a = Date.parse(fromIso ?? "");
@@ -97,14 +108,28 @@ const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
  *
  * @param parentId  本批 span 挂的父节点（主线=root span；子代理=父侧 Agent tool span 的派生 id）
  * @param agent     非空表示正在处理子代理那份 transcript，span 上补 agent_id/agent_type
+ * @param ctxBuf    上一批带来的滚动上下文缓冲（每轮 prompt 从这里截）
  */
-function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent }) {
+function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent, ctxBuf }) {
   const spans = [];
   const agentTags = agent ? { agent_id: agent.id, ...(agent.type ? { agent_type: agent.type } : {}) } : {};
   // 子代理 agent span 的 ts 与 input：实测子代理 transcript 首行即 type=user、
   // content 为字符串的那条 prompt。
   let firstEntryTs = null;
   let firstUserText = null;
+
+  // 每轮完整 prompt（DBDOG_OBS_STORE_LLM_INPUT，本地落盘）：按出现顺序把消息正文滚进
+  // 缓冲、只留尾部 ctxBufCap 字符——每轮 llm span 的 input_local 取"该轮模型调用之前的
+  // 快照"，截尾存。近似声明：系统提示不在 transcript 里（头部由 root/agent span 的
+  // input 覆盖）；tool_use 只留名字标记不进正文（参数在 tool span 里，重复存没意义）；
+  // 长度以 usage 的 token 计数为准，正文只是给复盘看内容。
+  let ctx = ctxBuf ?? "";
+  const ctxCap = ctxBufCap();
+  const pushCtx = (s) => {
+    if (!s) return;
+    const next = ctx ? `${ctx}\n${s}` : s; // 空缓冲首推不带前导换行
+    ctx = next.length > ctxCap ? next.slice(-ctxCap) : next;
+  };
 
   // 按 requestId 归并（实测坑，2026-07-09 首轮闭环发现）：一次 API 响应会按内容块拆成
   // 多条 assistant 行——requestId 相同、usage 逐行重复。一次模型调用 = 一个 llm span，
@@ -122,6 +147,7 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
     if (entry?.timestamp && firstEntryTs == null) firstEntryTs = entry.timestamp;
     if (firstUserText == null && entry?.type === "user" && typeof entry.message?.content === "string") {
       firstUserText = entry.message.content;
+      pushCtx(`[user]\n${entry.message.content}`);
     }
 
     if (entry?.type === "assistant" && Array.isArray(entry.message?.content)) {
@@ -158,15 +184,23 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
         else {
           // 新组的时长近似起点 = 组首行之前那条 entry 的落盘时刻（通常是触发本次
           // 模型调用的 user/tool_result 行）。transcript 无请求发起时刻，这是下批近似。
-          cur = { rid, entries: [entry], startTs: lastEntryTs };
+          // ctxSnapshot 取在本行内容入缓冲之前 = "该轮模型调用实际看到的上下文"。
+          cur = { rid, entries: [entry], startTs: lastEntryTs, ctxSnapshot: ctx };
           groups.push(cur);
         }
       }
+      // 本轮输出进缓冲（下一轮的 prompt 包含它）；tool_use 只留名字标记，参数不入
+      pushCtx(`[assistant]\n${assistantText(entry.message.content)}`);
     }
 
     // tool_result 配对（在 user 行里；is_error 的失败调用照记——transport 断掉的
     // MCP 调用也在这里留痕，服务端视角反而看不见）
     if (entry?.type === "user" && Array.isArray(entry.message?.content)) {
+      // 本轮注入的内容先进缓冲（模型下一轮会看到）：tool_result 正文 + 夹带的文本块
+      for (const b of entry.message.content) {
+        if (b?.type === "tool_result") pushCtx(`[tool_result ${b.tool_use_id}]\n${toolResultText(b.content)}`);
+        else if (typeof b?.text === "string") pushCtx(`[user]\n${b.text}`);
+      }
       for (const b of entry.message.content) {
         if (b?.type !== "tool_result" || !b.tool_use_id) continue;
         const use = pendingToolUses.get(b.tool_use_id);
@@ -251,7 +285,10 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
       status: "ok",
       ts: (duration != null ? g.startTs : first.timestamp) ?? new Date().toISOString(),
       duration_ms: duration,
-      input: null, // 每轮完整 prompt = 之前全部对话，逐轮重复入盘不划算；任务级 in/out 在 root
+      input: null, // 上报侧恒 null：远端只看 token；完整 prompt 走 input_local 纯本地
+      // input_local：该轮模型调用实际看到的上下文（截尾，contentCap 控制长度）。
+      // 开关 DBDOG_OBS_STORE_LLM_INPUT=0 可关；只在 spans.jsonl，reportSpans 前剥离。
+      ...(storeLlmInput() ? { input_local: capTail(g.ctxSnapshot ?? "") } : {}),
       output: cap(g.entries.map((e) => assistantText(e.message?.content)).filter(Boolean).join("\n")),
       tokens_input: msg.usage.input_tokens ?? null,
       tokens_output: msg.usage.output_tokens ?? null,
@@ -268,7 +305,7 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
     });
   }
 
-  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText };
+  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf: ctx };
 }
 
 /**
@@ -302,7 +339,7 @@ async function handleSubagent(input, main) {
   const selfSpanId = deriveSpanId(main.trace_id, agentId);
   const parentToolSpanId = deriveSpanId(main.trace_id, `tool:${agentId}`);
 
-  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf } = synthesize({
     lines,
     traceId: main.trace_id,
     sessionId: main.session_id ?? input.session_id,
@@ -311,6 +348,7 @@ async function handleSubagent(input, main) {
     pendingToolUses: new Map(Object.entries(sub.pending_tool_uses ?? {})),
     lastEntryTs: sub.last_entry_ts ?? null,
     agent: { id: agentId, type: input.agent_type ?? null },
+    ctxBuf: sub.ctx_buf ?? "",
   });
 
   // 子代理自己的 agent span（一个自治单元 = 一条 agent span，便于按 kind 数出
@@ -354,6 +392,7 @@ async function handleSubagent(input, main) {
       started_at: startedAt ?? null,
       prompt: prompt ?? null,
       pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
+      ctx_buf: ctxBuf,
     },
     agentId,
   );
@@ -365,7 +404,7 @@ async function handleMain(input, state) {
   if (!transcript) return;
 
   const { lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0);
-  const { spans, pendingToolUses, lastEntryTs } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, ctxBuf } = synthesize({
     lines,
     traceId: state.trace_id,
     sessionId: state.session_id,
@@ -374,6 +413,7 @@ async function handleMain(input, state) {
     pendingToolUses: new Map(Object.entries(state.pending_tool_uses ?? {})),
     lastEntryTs: state.last_entry_ts ?? null,
     agent: null,
+    ctxBuf: state.ctx_buf ?? "",
   });
 
   // root agent span：同 span_id 重发，后写赢。
@@ -402,6 +442,7 @@ async function handleMain(input, state) {
   state.cursor = nextCursor;
   state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
+  state.ctx_buf = ctxBuf;
   state.pending_tool_uses = Object.fromEntries(
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),
   );

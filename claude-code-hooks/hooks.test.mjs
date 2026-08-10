@@ -284,6 +284,126 @@ describe("Stop hook span synthesis", () => {
   });
 });
 
+// —— llm span 本地完整 prompt（input_local，2026-08-10）——
+// 上报侧 input 恒 null，完整 prompt 只在 spans.jsonl 里（DBDOG_OBS_STORE_LLM_INPUT 可关），
+// reportSpans 前剥离。快照取"该轮模型调用之前的滚动上下文"，截尾存。
+describe("llm span 本地完整 prompt", () => {
+  it("accumulates the context per round into input_local, tool_use args excluded", () => {
+    const dir = tempObsDir();
+    const transcript = writeTranscript(dir, "t.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+      {
+        type: "assistant",
+        timestamp: T("05.000"),
+        requestId: "req_1",
+        message: {
+          model: "m",
+          usage: { input_tokens: 3, output_tokens: 50 },
+          content: [
+            { type: "text", text: "先看进程" },
+            { type: "tool_use", id: "tu_local", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+      },
+      {
+        type: "user",
+        timestamp: T("07.500"),
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_local", content: "file1\nfile2" }] },
+      },
+      {
+        type: "assistant",
+        timestamp: T("20.000"),
+        requestId: "req_2",
+        message: { model: "m", usage: { input_tokens: 2, output_tokens: 80 }, content: [{ type: "text", text: "结论如下" }] },
+      },
+    ]);
+    seedState(dir, "s1", transcript);
+
+    runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "结论如下" }, dir);
+    const llm = readSpans(dir).filter((s) => s.kind === "llm");
+    expect(llm).toHaveLength(2);
+    // 第 1 轮的 prompt = 初始用户消息（快照取在本次输出入缓冲之前）
+    expect(llm[0].input_local).toBe("[user]\n诊断: 为什么卡住");
+    // 上报视角 input 恒 null，不随 input_local 变化
+    expect(llm[0].input).toBeNull();
+    // 第 2 轮的 prompt = 初始消息 + 第 1 轮输出 + tool_result 注入
+    expect(llm[1].input_local).toContain("[user]\n诊断: 为什么卡住");
+    expect(llm[1].input_local).toContain("[assistant]\n先看进程");
+    expect(llm[1].input_local).toContain("[tool_result tu_local]\nfile1\nfile2");
+    // tool_use 只留名字标记，参数不进缓冲（tool span 已存全文）
+    expect(llm[1].input_local).toContain("[tool_use: Bash]");
+    expect(llm[1].input_local).not.toContain('"command"');
+  });
+
+  it("caps the context buffer and tail-caps the snapshot", () => {
+    const dir = tempObsDir();
+    const transcript = writeTranscript(dir, "t.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "A".repeat(60) } },
+      {
+        type: "assistant",
+        timestamp: T("05.000"),
+        requestId: "req_1",
+        message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
+      },
+    ]);
+    seedState(dir, "s1", transcript);
+    runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" }, dir, {
+      DBDOG_OBS_CTX_BUF_CHARS: "40",
+      DBDOG_OBS_CONTENT_CHARS: "10",
+    });
+    const llm = readSpans(dir).find((s) => s.kind === "llm");
+    // 缓冲截尾（"[user]\n" + 60 个 A → 剩尾部 40 个 A），快照再截尾到 contentCap=10
+    expect(llm.input_local).toBe("A".repeat(10));
+  });
+
+  it("omits input_local when DBDOG_OBS_STORE_LLM_INPUT=0", () => {
+    const dir = tempObsDir();
+    const transcript = writeTranscript(dir, "t.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+      {
+        type: "assistant",
+        timestamp: T("05.000"),
+        requestId: "req_1",
+        message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
+      },
+    ]);
+    seedState(dir, "s1", transcript);
+    runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" }, dir, {
+      DBDOG_OBS_STORE_LLM_INPUT: "0",
+    });
+    expect(readSpans(dir).find((s) => s.kind === "llm").input_local).toBeUndefined();
+  });
+
+  it("keeps input_local out of the reported payload: local JSONL has it, sink does not", async () => {
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      const transcript = writeTranscript(dir, "t.jsonl", [
+        { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+        {
+          type: "assistant",
+          timestamp: T("05.000"),
+          requestId: "req_1",
+          message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
+        },
+      ]);
+      seedState(dir, "s1", transcript);
+      await runHookAsync(
+        "stop.mjs",
+        { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" },
+        dir,
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "test-key" },
+      );
+      expect(readSpans(dir).find((s) => s.kind === "llm").input_local).toBe("[user]\n诊断: 为什么卡住");
+      const reported = sink.received.find((s) => s.kind === "llm");
+      expect(reported).toBeDefined();
+      expect(reported.input_local).toBeUndefined();
+    } finally {
+      await sink.close();
+    }
+  });
+});
+
 // —— 子代理路径追踪（2026-08-09）——
 // 上游 Claude Code 2.1.x 把子代理会话流水拆成独立文件 <session>/subagents/agent-<id>.jsonl，
 // 主 transcript 里不再有 isSidechain 行。SubagentStop 实测入参：

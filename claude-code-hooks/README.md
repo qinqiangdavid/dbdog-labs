@@ -118,7 +118,11 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
   `DBDOG_OBS_CONTENT_CHARS`（内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS` 先例）、
   `DBDOG_OBS_ML_APP`（应用名标签，打进 root/llm span 的 `tags.ml_app`；缺省 = 项目目录名。
-  复盘按它过滤——同一台机器上编码会话与真诊断靠它分开）
+  复盘按它过滤——同一台机器上编码会话与真诊断靠它分开）、
+  `DBDOG_OBS_STORE_LLM_INPUT`（llm span 的每轮完整 prompt 是否落本地 JSONL，默认开；
+  `0`/`off` 关；只进 `spans.jsonl`，上报前剥离）、
+  `DBDOG_OBS_CTX_BUF_CHARS`（上下文滚动缓冲上限，默认 200000 字符——每轮 prompt 从它
+  截尾，也防状态文件无限膨胀）
 
 ## 触发门（DBDOG_OBS_MODE，2026-07-11）
 
@@ -184,7 +188,11 @@ mcp 不双写、不上报，跟没装一样）：
 **一次模型调用 = 一个 llm span**：transcript 把一次 API 响应按内容块拆成多条 assistant 行
 （requestId 相同、usage 重复），合成器按 requestId 归并——逐行出 span 会虚增轮数 2-3 倍
 （首轮闭环实测坑）。
-llm span 的 `input` 置空（每轮完整 prompt = 之前全部对话，逐轮重复入盘不划算）；
+llm span 的 `input` 恒 null（上报侧不推全文，远端只看树形与 token）；每轮完整 prompt
+按 `DBDOG_OBS_STORE_LLM_INPUT`（默认开）截尾存进本地 `input_local`（截断上限同
+`DBDOG_OBS_CONTENT_CHARS`，取尾部——新注入的内容才解释上下文为什么膨胀；系统提示不在
+transcript 里、tool_use 参数不入缓冲、长度以 usage 的 token 计数为准）。`input_local`
+**只进本地 `spans.jsonl`，reportSpans 上报前剥离**，远端 schema 不动、带宽不浪费。
 任务级 in/out 在 root span，子代理级在其 agent span。`duration_ms` 是近似值
 （前一条 entry 落盘 → 组内末行落盘），打 `duration_estimated` 标区分。
 
