@@ -20,6 +20,9 @@
 // 输出追加到 spans.jsonl。root span 可能随多次 Stop 重发（同 span_id），读侧按"后写赢"去重。
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   readStdinJson,
   readState,
@@ -35,6 +38,10 @@ import {
   lookupSpans,
   pendingIds,
 } from "./lib.mjs";
+import { summaryEnv } from "./summary.mjs";
+
+/** 诊断流程总结 detached worker（与 stop.mjs 同目录）。 */
+const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-worker.mjs");
 
 /** 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。 */
 function readNewLines(file, cursor) {
@@ -415,6 +422,8 @@ async function handleMain(input, state) {
     agent: null,
     ctxBuf: state.ctx_buf ?? "",
   });
+  // 本轮新增的工具调用数（= 诊断有新进展的信号；纯 Q&A 回合无新工具，不触发总结重算）。
+  const newToolCount = spans.filter((s) => s.kind === "tool").length;
 
   // root agent span：同 span_id 重发，后写赢。
   spans.push({
@@ -447,6 +456,20 @@ async function handleMain(input, state) {
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),
   );
   writeState(input.session_id, state);
+
+  // 诊断流程总结：本轮有新工具调用、且配了本地大模型 → 后台 detach 起 worker 生成总结。
+  // 不 await、不阻塞 Stop（用户零等待）；worker 读 spans.jsonl 真相源、按固定 span_id 后写赢。
+  // 失败必须吞掉——spawn 不得打断会话。
+  if (newToolCount > 0 && summaryEnv()) {
+    try {
+      spawn(process.execPath, [WORKER, input.session_id], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    } catch {
+      /* best-effort：起不来就这次没总结，不影响 trace */
+    }
+  }
 }
 
 run(async () => {
