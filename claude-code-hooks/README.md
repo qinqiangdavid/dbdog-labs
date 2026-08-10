@@ -134,7 +134,7 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   `DBDOG_SUMMARY_LLM_BASE_URL`（诊断流程总结用的本地大模型端点，默认
   `https://open.bigmodel.cn/api/anthropic`）、`DBDOG_SUMMARY_LLM_API_KEY`（对应 API key，
   自备——去 bigmodel.cn 申请；单独配、不复用 agent 登录凭证，方便分发给别人）、
-  `DBDOG_SUMMARY_LLM_MODEL`（默认 `glm-5.2`）、`DBDOG_SUMMARY_LLM_TIMEOUT_MS`（默认 30000）。
+  `DBDOG_SUMMARY_LLM_MODEL`（默认 `glm-5.2`；**用裸模型名，别带 Claude Code 的 `[1m]` 等路由后缀**——裸 GLM API 不认，会 HTTP 400；即便误填了 `[1m]`，`summaryEnv` 会自动剥掉）、`DBDOG_SUMMARY_LLM_TIMEOUT_MS`（默认 30000）。
   三者（至少 BASE_URL + API_KEY）配齐才出总结；否则 banner 空、trace 不受影响。
 
 ## 触发门（DBDOG_OBS_MODE，2026-07-11）

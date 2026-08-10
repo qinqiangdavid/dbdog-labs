@@ -31,6 +31,9 @@ describe("summaryEnv", () => {
     expect(env.timeoutMs).toBe(30_000);
     process.env.DBDOG_SUMMARY_LLM_MODEL = "glm-4";
     expect(summaryEnv().model).toBe("glm-4");
+    // Claude Code 路由后缀 [1m] 会被剥掉（裸 GLM API 不认，否则 HTTP 400）
+    process.env.DBDOG_SUMMARY_LLM_MODEL = "glm-5.2[1m]";
+    expect(summaryEnv().model).toBe("glm-5.2");
   });
 });
 
