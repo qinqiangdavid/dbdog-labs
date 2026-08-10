@@ -48,6 +48,18 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/claude-code-hooks/session-start.mjs\"",
+            "timeout": 10,
+            "statusMessage": "dbdog-obs: sweep backlog"
+          }
+        ]
+      }
     ]
   }
 }

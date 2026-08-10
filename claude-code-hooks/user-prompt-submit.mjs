@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readStdinJson, readState, writeState, run } from "./lib.mjs";
+import { readStdinJson, readState, writeState, pendingIds, run } from "./lib.mjs";
 
 run(async () => {
   const input = await readStdinJson();
@@ -63,5 +63,9 @@ run(async () => {
     transcript_path: input.transcript_path ?? null,
     cursor,
     root_emitted: false,
+    // 上一轮没送达的 span 必须带过来：这里写的是全新 state 对象，不显式继承就等于
+    // 把"它们没送达"这件事一起抹掉——之后连 sweep 也无从救起（实测有一条 trace
+    // 因此永久缺了 109 条 span，且不在任何状态文件里）。
+    pending_spans: pendingIds(readState(sessionId)?.pending_spans),
   });
 });
