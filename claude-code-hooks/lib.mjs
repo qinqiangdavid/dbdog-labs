@@ -106,6 +106,7 @@ export function pendingIds(pending) {
  *                       （mcp 原样转发内网 dbdog-server；用户机器不直连 server。
  *                        server 直连仅限内网部署场景。）
  *   DBDOG_OBS_API_KEY     dbdog API key（控制台 settings/api-keys 签发）
+ *   DBDOG_OBS_REPORT_TIMEOUT_MS  上报超时，见 reportTimeoutMs()
  */
 export async function reportSpans(spans) {
   const url = process.env.DBDOG_OBS_REPORT_URL?.trim();
@@ -118,13 +119,25 @@ export async function reportSpans(spans) {
       // input_local（每轮完整 prompt，见 stop.mjs）是纯本地字段：远端只看树形与 token，
       // 不推全文。pending 重发捞回本地 JSONL 的 span 同样带该字段，在这里一并剥掉。
       body: JSON.stringify({ spans: spans.map(({ input_local, ...rest }) => rest) }),
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(reportTimeoutMs()),
     });
     return response.ok;
   } catch {
     // best-effort：上报不可达不影响本地沉淀
     return false;
   }
+}
+
+/**
+ * 上报超时（ms，默认 3000）。默认值按「本机直连 mcp」定：实测 ingest 服务端只花几毫秒，
+ * 3s 绰绰有余。但客户端常挂在透明代理/隧道后（TUN 模式的机场客户端连 `--noproxy` 都截走），
+ * 首字节被拉到 1–4s 抖动，正好骑在 3s 上——症状是 spans.jsonl 有、平台上没有，且
+ * `pending_spans` 每轮累积、重发包越滚越大越发不可能成功。这种链路放宽到 10000–15000。
+ * 根治仍是给 mcp 地址加代理直连规则；本值只是不依赖用户改代理的保底。
+ */
+export function reportTimeoutMs() {
+  const n = Number(process.env.DBDOG_OBS_REPORT_TIMEOUT_MS ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 3000;
 }
 
 /** 内容截断上限（对齐 mcp 的 DBDOG_TELEMETRY_OUTPUT_CHARS 先例，默认 8000）。 */

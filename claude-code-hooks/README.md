@@ -122,7 +122,9 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   `DBDOG_OBS_STORE_LLM_INPUT`（llm span 的每轮完整 prompt 是否落本地 JSONL，默认开；
   `0`/`off` 关；只进 `spans.jsonl`，上报前剥离）、
   `DBDOG_OBS_CTX_BUF_CHARS`（上下文滚动缓冲上限，默认 200000 字符——每轮 prompt 从它
-  截尾，也防状态文件无限膨胀）
+  截尾，也防状态文件无限膨胀）、
+  `DBDOG_OBS_REPORT_TIMEOUT_MS`（上报超时，默认 3000；透明代理/隧道后的机器放宽到
+  10000–15000，见故障排查倒数第二行）
 
 ## 触发门（DBDOG_OBS_MODE，2026-07-11）
 
@@ -147,6 +149,7 @@ mcp 不双写、不上报，跟没装一样）：
 | 树里看不到子代理内部的工具调用（只有一条 `Agent` tool span，底下是空的） | 旧版 `stop.mjs` 只读主 transcript，而子代理内容在独立文件里 | 升级到 2026-08-09 之后的 kit（SubagentStop 改读 `agent_transcript_path`） |
 | span 只在本地 `spans.jsonl`，平台上没有 | 上报 env 没配齐（两个都要），或上报失败后卡在 `pending_spans` 里（见《收尸机制》） | 补 `DBDOG_OBS_REPORT_URL` + `DBDOG_OBS_API_KEY`（安装 Step 4），用前提清单第 5 行的 curl 验证；已卡住的跑 `node sweep.mjs` 补发 |
 | span 被服务端拒收（4xx） | 真实拒收原因只有：`trace_id`/`span_id`/`kind` 缺失、`ts` 非 RFC3339、同批 `span_id` 重复、批量超 1000 条或 5MB | 照此自查。**`parent_id` 服务端不做任何校验**，不必等于 `trace_id` 前 16 hex；另注意字段名是 `parent_id`，写成 `parent_span_id` 会被静默丢弃 |
+| env 配齐了、`sweep.mjs` 也补发不掉，`pending_spans` 反而越滚越大 | 上报超时。机器挂透明代理/隧道（TUN 模式客户端连 `--noproxy` 都截）时首字节被拉到 1–4s，骑在默认 3s 上；失败一轮包更大、更超时 | 量一下：`time curl -s -o /dev/null -X POST $DBDOG_OBS_REPORT_URL -H "DD-API-KEY: $DBDOG_OBS_API_KEY" -d '{"spans":[]}'`（400「spans 为空」= 通）。超 1s 就给 mcp 地址加代理直连规则（根治），或 `DBDOG_OBS_REPORT_TIMEOUT_MS=15000`（保底） |
 | settings 里有 `curl → localhost:8126/claude/hooks` 一类 hook | 历史遗留实验，**不属于本 kit**，静默空转 | 删除；本 kit 全链路不经过 8126 |
 
 ## span 形状（v2 三层树，2026-08-09）

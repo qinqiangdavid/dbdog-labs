@@ -36,6 +36,7 @@ hooks 路径由插件机制（`${CLAUDE_PLUGIN_ROOT}`）自动解析，不改任
 | `DBDOG_OBS_API_KEY` | 个人 key（控制台 settings → api-keys 签发，`dbdog_` 前缀，只显示一次） | 同上 |
 | `DBDOG_OBS_MODE` | `triggered`（默认，「诊断:」触发）/ `always`（全记）/ `off` | 否 |
 | `DBDOG_OBS_ML_APP` | trace 分桶名，缺省 = 目录名 | 否 |
+| `DBDOG_OBS_REPORT_TIMEOUT_MS` | 上报超时，默认 3000。**机器挂透明代理/隧道时放宽到 10000–15000**——那类链路首字节 1–4s 抖动，卡在 3s 上会表现成「本地 spans.jsonl 有、控制台空」 | 否 |
 
 前两个放进个人 `~/.claude/settings.json` 的 `env` 块（个人文件，不进 git）：
 

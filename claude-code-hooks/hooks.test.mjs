@@ -1063,3 +1063,26 @@ describe("父侧 Agent span 带上子代理的聚合开销", () => {
     }
   });
 });
+
+// —— 上报超时可配（2026-08-10）——
+// 默认 3000 按「直连 mcp」定；透明代理/隧道后的机器首字节 1–4s 抖动会一直 abort，
+// 症状是 spans.jsonl 有、平台空，且 pending 越滚越大。
+describe("上报超时可配", () => {
+  const original = process.env.DBDOG_OBS_REPORT_TIMEOUT_MS;
+  afterEach(() => {
+    if (original === undefined) delete process.env.DBDOG_OBS_REPORT_TIMEOUT_MS;
+    else process.env.DBDOG_OBS_REPORT_TIMEOUT_MS = original;
+  });
+
+  it("缺省 3000，正数覆盖，非法值退回缺省", async () => {
+    const { reportTimeoutMs } = await import("./lib.mjs");
+    delete process.env.DBDOG_OBS_REPORT_TIMEOUT_MS;
+    expect(reportTimeoutMs()).toBe(3000);
+    process.env.DBDOG_OBS_REPORT_TIMEOUT_MS = "15000";
+    expect(reportTimeoutMs()).toBe(15000);
+    for (const bad of ["", "abc", "0", "-1"]) {
+      process.env.DBDOG_OBS_REPORT_TIMEOUT_MS = bad;
+      expect(reportTimeoutMs()).toBe(3000);
+    }
+  });
+});
