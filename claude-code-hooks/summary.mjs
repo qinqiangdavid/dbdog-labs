@@ -17,7 +17,8 @@
 export function summaryEnv() {
   const baseUrl = process.env.DBDOG_SUMMARY_LLM_BASE_URL?.trim();
   const apiKey = process.env.DBDOG_SUMMARY_LLM_API_KEY?.trim();
-  const model = process.env.DBDOG_SUMMARY_LLM_MODEL?.trim() || "glm-5.2";
+  // 剥离尾部 [1m] 之类的 Claude Code 路由后缀——裸 GLM API 不认（实测 HTTP 400）。
+  const model = (process.env.DBDOG_SUMMARY_LLM_MODEL?.trim() || "glm-5.2").replace(/\[[^\]]*\]$/, "");
   if (!baseUrl || !apiKey || apiKey.startsWith("change-me") || apiKey.startsWith("<")) return null;
   const timeoutMs = Number(process.env.DBDOG_SUMMARY_LLM_TIMEOUT_MS) || 30_000;
   return { baseUrl, apiKey, model, timeoutMs };
@@ -202,7 +203,10 @@ export async function generateSummary(messages, env) {
     }),
     signal: AbortSignal.timeout(env.timeoutMs),
   });
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`LLM HTTP ${res.status}: ${detail.slice(0, 300)}`);
+  }
   const data = await res.json();
   const text = (data?.content ?? [])
     .filter((b) => b.type === "text")
