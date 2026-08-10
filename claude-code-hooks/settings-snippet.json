@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
+            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' DBDOG_SUMMARY_LLM_BASE_URL='https://open.bigmodel.cn/api/anthropic' DBDOG_SUMMARY_LLM_API_KEY='<填GLM key，不配则不出诊断流程总结>' DBDOG_SUMMARY_LLM_MODEL='glm-5.2' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
+            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' DBDOG_SUMMARY_LLM_BASE_URL='https://open.bigmodel.cn/api/anthropic' DBDOG_SUMMARY_LLM_API_KEY='<填GLM key，不配则不出诊断流程总结>' DBDOG_SUMMARY_LLM_MODEL='glm-5.2' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
           }
         ]
       }
