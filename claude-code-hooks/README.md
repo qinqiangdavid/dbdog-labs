@@ -37,6 +37,10 @@
 
 ## 安装（5 步，全带命令）
 
+> **省事路径**：装好插件（或取到 kit 路径）后直接 `node claude-code-hooks/install.mjs`——
+> 它自动从 `~/.claude.json` 检出上报URL、校验 `dbdog_` key、把 `DBDOG_OBS_API_KEY` + `DBDOG_OBS_REPORT_URL`
+> 写进 settings.json 的 env 块，诊断总结默认复用 `ANTHROPIC_*`（无需另配）。下面的 5 步是手动等价流程。
+
 **Step 1 — 取 kit，定路径**（本目录随公开仓 `zlxtqbdgdgd/dbdog-labs` 分发：clone 本仓、或从
 dbdog 控制台 `/downloads/client-kit/claude-code-hooks.tar.gz` 下载解包；更省事的插件安装
 方式见仓根 README——插件方式无需下面的 Step 2–3）：
@@ -115,7 +119,7 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   + `DBDOG_OBS_API_KEY`（控制台 settings/api-keys 签发）后，Stop / SubagentStop 合成的 span 会
   best-effort 从 MCP 边缘口 POST 入库；未设两 env = 只落本地，行为与 Phase A 相同。
   **注意这个 URL 是 mcp 边缘口，只收 `POST /spans`；查 trace 要走 dbdog-server 本体**
-- **诊断流程总结**（本地大模型生成，2026-08-11）：配齐 `DBDOG_SUMMARY_LLM_*`（见下）后，
+- **诊断流程总结**（本地大模型生成，2026-08-11）：默认复用 Claude Code 自身的 `ANTHROPIC_*`（或显式配齐 `DBDOG_SUMMARY_LLM_*`，见下）后，
   Stop 在「本轮有新工具调用」时 detached 起后台 `summary-worker.mjs`，读本 trace 的 span →
   裁剪（MCP 工具按 intent 留信号行 + Read/Grep/Bash 代码 token + agent 结论）→ 调本地大模型按
   提示词成文 → 作为一条 `kind=workflow`/`name=diagnosis-summary` 的 span 推上去；控制台 banner 读它。
@@ -131,11 +135,15 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   截尾，也防状态文件无限膨胀）、
   `DBDOG_OBS_REPORT_TIMEOUT_MS`（上报超时，默认 3000；透明代理/隧道后的机器放宽到
   10000–15000，见故障排查倒数第二行）、
-  `DBDOG_SUMMARY_LLM_BASE_URL`（诊断流程总结用的本地大模型端点，默认
-  `https://open.bigmodel.cn/api/anthropic`）、`DBDOG_SUMMARY_LLM_API_KEY`（对应 API key，
-  自备——去 bigmodel.cn 申请；单独配、不复用 agent 登录凭证，方便分发给别人）、
-  `DBDOG_SUMMARY_LLM_MODEL`（默认 `glm-5.2`；**用裸模型名，别带 Claude Code 的 `[1m]` 等路由后缀**——裸 GLM API 不认，会 HTTP 400；即便误填了 `[1m]`，`summaryEnv` 会自动剥掉）、`DBDOG_SUMMARY_LLM_TIMEOUT_MS`（默认 30000）。
-  三者（至少 BASE_URL + API_KEY）配齐才出总结；否则 banner 空、trace 不受影响。
+  `DBDOG_SUMMARY_LLM_*`（诊断流程总结的 LLM 端点，**可选**）：`summaryEnv` 现先取 `DBDOG_SUMMARY_LLM_*`，
+  缺/占位则**回退到 Claude Code 自身的 `ANTHROPIC_*`**——
+  `BASE_URL`：`DBDOG_SUMMARY_LLM_BASE_URL` → `ANTHROPIC_BASE_URL` → `ANTHROPIC_API_URL` → `https://api.anthropic.com`；
+  `API_KEY`：`DBDOG_SUMMARY_LLM_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY`；
+  `MODEL`：`DBDOG_SUMMARY_LLM_MODEL` → `ANTHROPIC_MODEL`（剥 `[1m]` 路由后缀）→ 按 host 判定
+  （`bigmodel.cn`→`glm-5.2`、`anthropic.com`→`claude-haiku-4-5`、其余→`glm-5.2` 并 stderr 提示）。
+  所以**多数情况无需配** `DBDOG_SUMMARY_LLM_*`——Claude Code 能跑、总结就能出（避免把会轮换的 token
+  抄一份进 env，轮换两处不同步）。仅当想换端点时才覆盖这三项；`DBDOG_SUMMARY_LLM_TIMEOUT_MS` 默认 30000。
+  API_KEY 整条解析值缺失 = 没总结，trace 不受影响。
 
 ## 触发门（DBDOG_OBS_MODE，2026-07-11）
 

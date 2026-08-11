@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { trimSpans, buildPrompt, generateSummary, summaryEnv, SYSTEM_PROMPT } from "./summary.mjs";
 
 const baseEnv = {
@@ -6,12 +6,24 @@ const baseEnv = {
   DBDOG_SUMMARY_LLM_API_KEY: "sk-test",
 };
 
-afterEach(() => {
-  delete process.env.DBDOG_SUMMARY_LLM_BASE_URL;
-  delete process.env.DBDOG_SUMMARY_LLM_API_KEY;
-  delete process.env.DBDOG_SUMMARY_LLM_MODEL;
-  delete process.env.DBDOG_SUMMARY_LLM_TIMEOUT_MS;
-});
+// 清 DBDOG_SUMMARY_LLM_* + ANTHROPIC_*——后者尤其关键：开发机常驻 ANTHROPIC_AUTH_TOKEN，
+// 不清会让"全空→null"类断言在该机器上误判，也跨用例互相串味。
+const ENV_KEYS = [
+  "DBDOG_SUMMARY_LLM_BASE_URL",
+  "DBDOG_SUMMARY_LLM_API_KEY",
+  "DBDOG_SUMMARY_LLM_MODEL",
+  "DBDOG_SUMMARY_LLM_TIMEOUT_MS",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_API_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_MODEL",
+];
+const cleanEnv = () => {
+  for (const k of ENV_KEYS) delete process.env[k];
+};
+beforeEach(cleanEnv);
+afterEach(cleanEnv);
 
 describe("summaryEnv", () => {
   it("未配 / 占位 → null（不出总结）", () => {
@@ -33,6 +45,51 @@ describe("summaryEnv", () => {
     expect(summaryEnv().model).toBe("glm-4");
     // Claude Code 路由后缀 [1m] 会被剥掉（裸 GLM API 不认，否则 HTTP 400）
     process.env.DBDOG_SUMMARY_LLM_MODEL = "glm-5.2[1m]";
+    expect(summaryEnv().model).toBe("glm-5.2");
+  });
+});
+
+describe("summaryEnv · ANTHROPIC_* 回退", () => {
+  it("DBDOG 缺、ANTHROPIC_* 在 → 复用 ANTHROPIC 凭据 + bigmodel host 默认 glm-5.2", () => {
+    process.env.ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic";
+    process.env.ANTHROPIC_AUTH_TOKEN = "glm-token";
+    const env = summaryEnv();
+    expect(env).not.toBeNull();
+    expect(env.baseUrl).toBe("https://open.bigmodel.cn/api/anthropic");
+    expect(env.apiKey).toBe("glm-token");
+    expect(env.model).toBe("glm-5.2");
+  });
+
+  it("DBDOG 显式值优先于 ANTHROPIC_*", () => {
+    process.env.DBDOG_SUMMARY_LLM_BASE_URL = "https://dbdog.example/anthropic";
+    process.env.DBDOG_SUMMARY_LLM_API_KEY = "dbdog-key";
+    process.env.ANTHROPIC_AUTH_TOKEN = "should-not-win";
+    const env = summaryEnv();
+    expect(env.apiKey).toBe("dbdog-key");
+    expect(env.baseUrl).toBe("https://dbdog.example/anthropic");
+  });
+
+  it("占位 apiKey 视同未配 → 回退到 ANTHROPIC_*", () => {
+    process.env.DBDOG_SUMMARY_LLM_API_KEY = "<填GLM key>";
+    process.env.ANTHROPIC_AUTH_TOKEN = "real-token";
+    process.env.ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic";
+    const env = summaryEnv();
+    expect(env).not.toBeNull();
+    expect(env.apiKey).toBe("real-token");
+  });
+
+  it("baseUrl 全缺 → 兜底 api.anthropic.com，host 判定 → claude-haiku-4-5", () => {
+    process.env.ANTHROPIC_AUTH_TOKEN = "claude-key";
+    // 不设任何 BASE_URL → 兜底 https://api.anthropic.com
+    const env = summaryEnv();
+    expect(env.baseUrl).toBe("https://api.anthropic.com");
+    expect(env.model).toBe("claude-haiku-4-5");
+  });
+
+  it("ANTHROPIC_MODEL 带 [路由后缀] 会被剥掉", () => {
+    process.env.ANTHROPIC_AUTH_TOKEN = "tok";
+    process.env.ANTHROPIC_BASE_URL = "https://open.bigmodel.cn/api/anthropic";
+    process.env.ANTHROPIC_MODEL = "glm-5.2[1m]";
     expect(summaryEnv().model).toBe("glm-5.2");
   });
 });
