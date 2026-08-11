@@ -1,4 +1,5 @@
 {
+  "_note_": "历史手动合并方式（2026-08-11 起推荐改用插件安装 + `node install.mjs`，见 README）。本片段不再含 DBDOG_SUMMARY_LLM_*——诊断流程总结默认复用 Claude Code 自身的 ANTHROPIC_*（summary.mjs summaryEnv 回退）。仅当想用别的端点时，才在 settings.json 的 env 块另加 DBDOG_SUMMARY_LLM_* 覆盖。用法：把 /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks 与两处 <占位> 替换后，按 README 的 jq 合并命令并进 settings.json 的 hooks。",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -26,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' DBDOG_SUMMARY_LLM_BASE_URL='https://open.bigmodel.cn/api/anthropic' DBDOG_SUMMARY_LLM_API_KEY='<填GLM key，不配则不出诊断流程总结>' DBDOG_SUMMARY_LLM_MODEL='glm-5.2' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
+            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
           }
         ]
       }
@@ -36,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' DBDOG_SUMMARY_LLM_BASE_URL='https://open.bigmodel.cn/api/anthropic' DBDOG_SUMMARY_LLM_API_KEY='<填GLM key，不配则不出诊断流程总结>' DBDOG_SUMMARY_LLM_MODEL='glm-5.2' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
+            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/stop.mjs"
           }
         ]
       }

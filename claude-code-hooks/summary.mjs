@@ -9,17 +9,75 @@
 
 // ---------- env ----------
 
+// 取首个"真实"值——空串与占位（change-me / <…> / ABSOLUTE/PATH）一律视同未设，继续看下一个。
+// 让 DBDOG_SUMMARY_LLM_* 占位能自动回退到 ANTHROPIC_*，而不是卡死在占位字面量上。
+function firstReal(...vals) {
+  for (const v of vals) {
+    const s = (v ?? "").trim();
+    if (!s) continue;
+    if (s.startsWith("change-me") || s.startsWith("<") || s.includes("ABSOLUTE/PATH")) continue;
+    return s;
+  }
+  return "";
+}
+
+// 剥离尾部 [1m] 之类的 Claude Code 路由后缀——裸模型 API 不认（实测 HTTP 400）。
+function stripModelSuffix(m) {
+  return (m || "").replace(/\[[^\]]*\]$/, "");
+}
+
+// 按 baseUrl 的 host 选默认模型：bigmodel→glm-5.2、anthropic.com→claude-haiku-4-5；未识别返回 ""。
+function defaultModelFor(baseUrl) {
+  let host = "";
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    host = "";
+  }
+  if (host.includes("bigmodel.cn")) return "glm-5.2";
+  if (host.includes("anthropic.com")) return "claude-haiku-4-5";
+  return "";
+}
+
 /**
- * 读 DBDOG_SUMMARY_LLM_*。BASE_URL 或 API_KEY 缺失/占位 → null（上层直接退出、不出总结）。
- * 单独配、不复用 agent 登录凭证：这是给别人用的能力，不能依赖每个人怎么启动/登录 claude
- * （OAuth / 真 Anthropic / 中继 / daemon 启动复用会静默失效）。
+ * 解析诊断总结的 LLM 端点配置。
+ *
+ * 每段都先取 DBDOG_SUMMARY_LLM_*（显式覆盖），缺/占位则回退到 Claude Code 自身的 ANTHROPIC_*：
+ *   baseUrl: DBDOG_SUMMARY_LLM_BASE_URL → ANTHROPIC_BASE_URL → ANTHROPIC_API_URL → "https://api.anthropic.com"
+ *   apiKey:  DBDOG_SUMMARY_LLM_API_KEY  → ANTHROPIC_AUTH_TOKEN → ANTHROPIC_API_KEY
+ *   model:   DBDOG_SUMMARY_LLM_MODEL → ANTHROPIC_MODEL（均剥 [路由后缀]）→ 按 baseUrl host 判定默认
+ *
+ * 回退到 ANTHROPIC_* 是为"零额外配置出总结"——Claude Code 本就跑在某个 Anthropic-Messages 兼容
+ * 端点上、凭据已在 env 里，复用比让用户再抄一份更稳（避免 token 轮换两处不同步）。请求走
+ * Anthropic Messages 协议（见 generateSummary），与 Claude Code 端点天然兼容。
+ *
+ * apiKey 最终解析值缺失 → 返回 null（不出总结，但不报错）。host 未识别且未显式指定 model →
+ * 兜底 glm-5.2 并 stderr 提示（让用户知道可设 DBDOG_SUMMARY_LLM_MODEL 覆盖）。
  */
 export function summaryEnv() {
-  const baseUrl = process.env.DBDOG_SUMMARY_LLM_BASE_URL?.trim();
-  const apiKey = process.env.DBDOG_SUMMARY_LLM_API_KEY?.trim();
-  // 剥离尾部 [1m] 之类的 Claude Code 路由后缀——裸 GLM API 不认（实测 HTTP 400）。
-  const model = (process.env.DBDOG_SUMMARY_LLM_MODEL?.trim() || "glm-5.2").replace(/\[[^\]]*\]$/, "");
-  if (!baseUrl || !apiKey || apiKey.startsWith("change-me") || apiKey.startsWith("<")) return null;
+  const baseUrl =
+    firstReal(
+      process.env.DBDOG_SUMMARY_LLM_BASE_URL,
+      process.env.ANTHROPIC_BASE_URL,
+      process.env.ANTHROPIC_API_URL,
+    ) || "https://api.anthropic.com";
+  const apiKey = firstReal(
+    process.env.DBDOG_SUMMARY_LLM_API_KEY,
+    process.env.ANTHROPIC_AUTH_TOKEN,
+    process.env.ANTHROPIC_API_KEY,
+  );
+  if (!apiKey) return null;
+
+  const explicitModel = stripModelSuffix(
+    firstReal(process.env.DBDOG_SUMMARY_LLM_MODEL, process.env.ANTHROPIC_MODEL),
+  );
+  const fallbackModel = defaultModelFor(baseUrl);
+  const model = explicitModel || fallbackModel || "glm-5.2";
+  if (!explicitModel && !fallbackModel) {
+    console.error(
+      "[dbdog-obs] 未识别总结端点 host，默认用 glm-5.2；不对请设 DBDOG_SUMMARY_LLM_MODEL",
+    );
+  }
   const timeoutMs = Number(process.env.DBDOG_SUMMARY_LLM_TIMEOUT_MS) || 30_000;
   return { baseUrl, apiKey, model, timeoutMs };
 }
