@@ -30,6 +30,12 @@ function runHook(script, input, obsDir, extraEnv = {}) {
       DBDOG_OBS_TRIGGER: "诊断:",
       DBDOG_OBS_DIR: obsDir,
       DBDOG_OBS_SPANS: path.join(obsDir, "spans.jsonl"),
+      // 上报通道默认掐断：开发机的 shell 里通常真配着 DBDOG_OBS_REPORT_URL/API_KEY
+      // （~/.dbdog/llmobs-obs.env 经 .zshenv 注入），继承下来会把夹具真的报到生产平台上去。
+      // 2026-08-12 实测踩过：一次全套跑完在 113 上多出 11 条 ml_app=proj 的垃圾 trace。
+      // 需要 sink 的用例自己用 extraEnv 覆盖（在 ...extraEnv 之前，所以覆盖得掉）。
+      DBDOG_OBS_REPORT_URL: "",
+      DBDOG_OBS_API_KEY: "",
       ...extraEnv,
     },
   });
@@ -722,6 +728,9 @@ function runScript(script, obsDir, extraEnv = {}, input) {
         ...process.env,
         DBDOG_OBS_DIR: obsDir,
         DBDOG_OBS_SPANS: path.join(obsDir, "spans.jsonl"),
+        // 同 runHook：默认掐断上报，别把夹具报到生产平台（需要 sink 的用例用 extraEnv 覆盖）
+        DBDOG_OBS_REPORT_URL: "",
+        DBDOG_OBS_API_KEY: "",
         ...extraEnv,
       },
     });
