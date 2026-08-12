@@ -1217,6 +1217,100 @@ describe("同一批 transcript 行重复合成必须幂等", () => {
   });
 });
 
+// —— 总结 span 的 ts 必须稳定（2026-08-12）——
+// 症状（尚未咬到线上，因总结那条链缺凭证）：总结会在每个"有新工具调用"的 Stop 之后重算，
+// span_id 是派生的（固定），但 ts 取 new Date() —— 墙上时钟。而 ClickHouse 那张表排序键是
+// (trace_id, ts, span_id)，ts 一变就是新行、FINAL 折不掉，于是平台上堆好几条总结；
+// 控制台 findSummarySpan 用 .find() 按 ts 序取，拿到的是最早那条 = 过期总结。
+// 与 span_id 幂等派生同一类错：只对上 span_id 没用，ts 也在排序键里。
+describe("总结 span 重复生成必须落同一行", () => {
+  /** Anthropic Messages 协议的桩端点。 */
+  async function startLlmStub() {
+    const server = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            content: [{ type: "text", text: "## 诊断流程总结\n桩返回的正文。" }],
+            usage: { input_tokens: 11, output_tokens: 22 },
+          }),
+        );
+      });
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return {
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      close: () => new Promise((r) => server.close(r)),
+    };
+  }
+
+  /** worker 的 sessionId 走 argv，不是 stdin，所以不能用 runScript。 */
+  function runWorker(dir, sessionId, extraEnv) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HOOK_DIR, "summary-worker.mjs"), sessionId], {
+        env: {
+          ...process.env,
+          DBDOG_OBS_DIR: dir,
+          DBDOG_OBS_SPANS: path.join(dir, "spans.jsonl"),
+          DBDOG_OBS_REPORT_URL: "",
+          DBDOG_OBS_API_KEY: "",
+          ...extraEnv,
+        },
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("error", reject);
+      child.on("close", (code) => {
+        expect(code, stderr).toBe(0);
+        resolve(stderr);
+      });
+    });
+  }
+
+  it("重算两次 → span_id 与 ts 都不变，且 ts 锚在 trace 起点", async () => {
+    const dir = tempObsDir();
+    const llm = await startLlmStub();
+    const traceId = "c".repeat(32);
+    const startedAt = "2026-07-15T00:00:00.000Z";
+    writeStateFile(dir, "sum.json", {
+      active: true,
+      trace_id: traceId,
+      root_span_id: traceId.slice(0, 16),
+      session_id: "sum",
+      ml_app: "testapp",
+      started_at: startedAt,
+    });
+    // worker 要求本 trace 至少有一条 span（真相源 = spans.jsonl）
+    fs.writeFileSync(
+      path.join(dir, "spans.jsonl"),
+      JSON.stringify({
+        trace_id: traceId,
+        span_id: traceId.slice(0, 16),
+        kind: "agent",
+        name: "claude-code.task",
+        ts: "2026-07-15T00:00:01.000Z",
+        output: "诊断结论：根因是 vacuum_cost_delay。",
+      }) + "\n",
+    );
+
+    const env = { DBDOG_SUMMARY_LLM_BASE_URL: llm.baseUrl, DBDOG_SUMMARY_LLM_API_KEY: "stub-key-123" };
+    try {
+      await runWorker(dir, "sum", env);
+      await runWorker(dir, "sum", env); // 第二轮重算（真实里由下一次 Stop 触发）
+    } finally {
+      await llm.close();
+    }
+
+    const sums = readSpans(dir).filter((s) => s.kind === "workflow" && s.name === "diagnosis-summary");
+    expect(sums).toHaveLength(2); // 本地 JSONL 追加两行是正常的
+    // 关键：两行必须同键同 ts，读侧（ClickHouse FINAL / byId 去重）才折得成一条
+    expect(new Set(sums.map((s) => s.span_id)).size).toBe(1);
+    expect(new Set(sums.map((s) => s.ts)).size).toBe(1);
+    expect(sums[0].ts).toBe(startedAt); // 锚在 trace 起点：总结描述的就是整条 trace
+  });
+});
+
 // —— 上报超时可配（2026-08-10）——
 // 默认 3000 按「直连 mcp」定；透明代理/隧道后的机器首字节 1–4s 抖动会一直 abort，
 // 症状是 spans.jsonl 有、平台空，且 pending 越滚越大。

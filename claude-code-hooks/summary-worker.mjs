@@ -2,7 +2,9 @@
 // summary-worker.mjs — 诊断流程总结 detached worker。
 // 由 stop.mjs handleMain 在「本 trace span 增长」时 spawn({detached:true}).unref() 起本进程，
 // 后台跑（用户零等待）：读本 trace 的 span → 裁剪（Y 方案）→ 调本地大模型 → 组装 workflow
-// 总结 span → appendSpans（本地真相源）+ reportSpans（推 server）。固定 span_id → 后写赢。
+// 总结 span → appendSpans（本地真相源）+ reportSpans（推 server）。
+// 重复生成落同一行：span_id 派生固定 + ts 锚 state.started_at（两者都进 ClickHouse 排序键，
+// 只固定 span_id 折不掉）→ 后写赢。
 // best-effort：env 未配 / 任何失败 → 直接返回，不打扰任何人（run() 兜底吞错、exit 0）。
 // 用法：node summary-worker.mjs <sessionId>
 import { readState, spanIndex, appendSpans, reportSpans, deriveSpanId, run } from "./lib.mjs";
@@ -38,7 +40,11 @@ run(async () => {
     name: SUMMARY_NAME,
     model: null,
     status: "ok",
-    ts: new Date().toISOString(),
+    // ts 锚在 trace 起点，不能取 new Date()：总结会在每个"有新工具调用"的 Stop 之后重算，
+    // 而 ClickHouse 那张表排序键是 (trace_id, ts, span_id)——ts 一变就是新行、FINAL 折不掉，
+    // 平台上会堆好几条总结，控制台 findSummarySpan 按 ts 序 .find() 到的还是最早那条（过期）。
+    // 固定 span_id 只解决一半，ts 也必须稳定。缺 started_at 的老状态退回墙上时钟。
+    ts: state.started_at ?? new Date().toISOString(),
     duration_ms: null,
     input: null,
     output: result.text,
