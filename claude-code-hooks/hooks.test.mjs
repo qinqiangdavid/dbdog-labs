@@ -1217,6 +1217,92 @@ describe("同一批 transcript 行重复合成必须幂等", () => {
   });
 });
 
+// —— trace 交界处的尾巴不能丢（2026-08-12）——
+// 实测：一条 trace 恒定丢最后一轮的 llm span。Stop 读 transcript 时，本轮收尾那几行
+// （通常就是产出结论的 assistant 行）往往还没落盘；而下一条 trace 铸造时游标会跳到文件
+// 当前末尾（cursor = statSync(size)），那几行就永久没人合成。
+// 字节级证据：cursor=8292 / 文件 10906，8292–10672 那两行带完整 usage 的 assistant 未被读。
+// 修法：铸造/停用时把 [旧 cursor, 交界时文件大小) 这段连同配对上下文记进 state.carry，
+// 下一次 Stop 按**旧** trace_id 补合成。上界取自交界时刻，所以不会把新一轮内容错记到旧 trace。
+describe("trace 交界处未落盘的尾巴要按旧 trace 补上", () => {
+  /** 只写用户那一行；带 usage 的 assistant 行留到"铸造之后"再追加，模拟落盘滞后。 */
+  function seedFirstTurn(dir, name) {
+    const p = writeTranscript(dir, name, [
+      { type: "user", uuid: "u-a", timestamp: T("00.000"), message: { role: "user", content: "诊断: 第一问" } },
+    ]);
+    return p;
+  }
+  const lateAssistant = {
+    type: "assistant",
+    uuid: "u-late",
+    timestamp: T("30.000"),
+    message: {
+      model: "claude-fable-5",
+      usage: { input_tokens: 100, output_tokens: 900 },
+      content: [{ type: "text", text: "## 诊断报告\n根因是 vacuum_cost_delay。" }],
+    },
+  };
+
+  it("下一条 trace 铸造时记下 carry，Stop 按旧 trace_id 补出 llm span", () => {
+    const dir = tempObsDir();
+    const tr = seedFirstTurn(dir, "boundary.jsonl");
+
+    runHook("user-prompt-submit.mjs", { session_id: "b1", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const first = readState(dir, "b1");
+    runHook("stop.mjs", { session_id: "b1", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+
+    // ← 收尾那行此刻才落盘（真实里 Stop 已经读过一遍了）
+    fs.appendFileSync(tr, JSON.stringify(lateAssistant) + "\n");
+
+    runHook("user-prompt-submit.mjs", { session_id: "b1", prompt: "诊断: 第二问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const second = readState(dir, "b1");
+    expect(second.trace_id).not.toBe(first.trace_id); // 确实铸了新 trace
+    expect(second.carry?.trace_id).toBe(first.trace_id);
+    expect(second.carry?.root_span_id).toBe(first.root_span_id);
+
+    runHook("stop.mjs", { session_id: "b1", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "第二问回答" }, dir);
+
+    const llmOfFirst = readSpans(dir).filter((s) => s.kind === "llm" && s.trace_id === first.trace_id);
+    expect(llmOfFirst).toHaveLength(1);
+    expect(llmOfFirst[0].parent_id).toBe(first.root_span_id); // 挂在旧 trace 的 root 下
+    expect(llmOfFirst[0].tokens_output).toBe(900);
+    expect(readState(dir, "b1").carry).toBeUndefined(); // 收完即清，不重复
+  });
+
+  it("换话题（不带触发词）同样收尾——trace 已 inactive 也要补", () => {
+    const dir = tempObsDir();
+    const tr = seedFirstTurn(dir, "boundary2.jsonl");
+
+    runHook("user-prompt-submit.mjs", { session_id: "b2", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const first = readState(dir, "b2");
+    runHook("stop.mjs", { session_id: "b2", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+    fs.appendFileSync(tr, JSON.stringify(lateAssistant) + "\n");
+
+    runHook("user-prompt-submit.mjs", { session_id: "b2", prompt: "顺便说下天气", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const off = readState(dir, "b2");
+    expect(off.active).toBe(false);
+    expect(off.carry?.trace_id).toBe(first.trace_id);
+
+    runHook("stop.mjs", { session_id: "b2", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "今天晴" }, dir);
+
+    const spans = readSpans(dir).filter((s) => s.trace_id === first.trace_id);
+    expect(spans.filter((s) => s.kind === "llm")).toHaveLength(1);
+    // 停用状态不得顺手再产 root span / 不得把新话题算进旧 trace
+    expect(spans.filter((s) => s.kind === "agent")).toHaveLength(1);
+    expect(readState(dir, "b2").carry).toBeUndefined();
+  });
+
+  it("交界时没有未读尾巴 → 不写 carry（不留空壳）", () => {
+    const dir = tempObsDir();
+    const tr = seedFirstTurn(dir, "boundary3.jsonl");
+    runHook("user-prompt-submit.mjs", { session_id: "b3", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    runHook("stop.mjs", { session_id: "b3", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+    // 不追加任何内容：游标已到文件末尾
+    runHook("user-prompt-submit.mjs", { session_id: "b3", prompt: "诊断: 第二问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    expect(readState(dir, "b3").carry).toBeUndefined();
+  });
+});
+
 // —— 总结 span 的 ts 必须稳定（2026-08-12）——
 // 症状（尚未咬到线上，因总结那条链缺凭证）：总结会在每个"有新工具调用"的 Stop 之后重算，
 // span_id 是派生的（固定），但 ts 取 new Date() —— 墙上时钟。而 ClickHouse 那张表排序键是

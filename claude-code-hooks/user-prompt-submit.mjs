@@ -22,6 +22,37 @@ run(async () => {
   // 上一条 trace 的 id、Stop 会把本轮的模型消息合成进上一条 trace（错误归属）。
   const mode = (process.env.DBDOG_OBS_MODE?.trim() || "triggered").toLowerCase();
   const promptText = (typeof input.prompt === "string" ? input.prompt : "").trimStart();
+  const prev = readState(sessionId);
+
+  /** transcript 当前大小 = 本次交界的字节位置（新 trace 的起点 / 旧 trace 的终点）。 */
+  let boundary = 0;
+  try {
+    boundary = fs.statSync(input.transcript_path).size;
+  } catch {
+    // 新 session 的 transcript 可能尚未落盘 → 从 0 起
+  }
+
+  /**
+   * 上一条 trace 交界时未落盘的尾巴。
+   * Stop 读 transcript 时，本轮收尾那几行（通常正是产出结论的 assistant 行）往往还没落盘；
+   * 而这里铸新 trace 会把游标跳到 boundary，那几行就永久没人合成——实测每条 trace 恒定丢
+   * 最后一轮的 llm span。把区间连同配对上下文交给 stop.mjs 的 flushCarry 按**旧** trace_id 补。
+   * 上界取交界时刻的大小，所以绝不会把新一轮的内容错记到旧 trace 上。
+   */
+  const carry =
+    prev?.trace_id && prev.active !== false && boundary > (prev.cursor ?? 0)
+      ? {
+          trace_id: prev.trace_id,
+          root_span_id: prev.root_span_id,
+          session_id: prev.session_id ?? sessionId,
+          ml_app: prev.ml_app,
+          from: prev.cursor ?? 0,
+          to: boundary,
+          transcript_path: prev.transcript_path ?? input.transcript_path ?? null,
+          pending_tool_uses: prev.pending_tool_uses ?? {},
+          last_entry_ts: prev.last_entry_ts ?? null,
+        }
+      : null;
 
   // —— 注入轮：不是新提问，一律原地返回（2026-08-12）——
   // 上游 Claude Code 的 Agent 工具是即时返回的后台派发，子代理跑完靠往会话里注入一轮
@@ -44,8 +75,10 @@ run(async () => {
     (mode === "triggered" &&
       (norm(promptText).startsWith(norm(trigger)) || norm(promptText).toLowerCase().startsWith("diag:")));
   if (!triggered) {
-    const prev = readState(sessionId);
-    if (prev && prev.active !== false) writeState(sessionId, { ...prev, active: false });
+    // 停用也是一次交界：本轮换了话题，旧 trace 的尾巴同样要收（stop.mjs 允许 inactive 时只收尾）。
+    if (prev && prev.active !== false) {
+      writeState(sessionId, { ...prev, active: false, ...(carry ? { carry } : {}) });
+    }
     return;
   }
 
@@ -57,14 +90,6 @@ run(async () => {
   const traceId = crypto.randomBytes(16).toString("hex"); // 32 hex（W3C trace-id 形状）
   const rootSpanId = traceId.slice(0, 16); // 16 hex，确定性派生
 
-  // transcript 读取游标：从当前文件末尾起——Stop 只合成本条 trace 的新增轮次。
-  let cursor = 0;
-  try {
-    cursor = fs.statSync(input.transcript_path).size;
-  } catch {
-    // 新 session 的 transcript 可能尚未落盘 → 从 0 起
-  }
-
   writeState(sessionId, {
     active: true,
     trace_id: traceId,
@@ -74,11 +99,14 @@ run(async () => {
     prompt: typeof input.prompt === "string" ? input.prompt : "",
     started_at: new Date().toISOString(),
     transcript_path: input.transcript_path ?? null,
-    cursor,
+    // 游标从交界处（当前文件末尾）起——Stop 只合成本条 trace 的新增轮次；交界之前若还有
+    // 未读的尾巴，已交给 carry 按旧 trace_id 收尾，既不丢也不会错记到新 trace 上。
+    cursor: boundary,
     root_emitted: false,
+    ...(carry ? { carry } : {}),
     // 上一轮没送达的 span 必须带过来：这里写的是全新 state 对象，不显式继承就等于
     // 把"它们没送达"这件事一起抹掉——之后连 sweep 也无从救起（实测有一条 trace
     // 因此永久缺了 109 条 span，且不在任何状态文件里）。
-    pending_spans: pendingIds(readState(sessionId)?.pending_spans),
+    pending_spans: pendingIds(prev?.pending_spans),
   });
 });

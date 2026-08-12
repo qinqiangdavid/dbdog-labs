@@ -49,9 +49,12 @@ import { summaryEnv } from "./summary.mjs";
 /** 诊断流程总结 detached worker（与 stop.mjs 同目录）。 */
 const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-worker.mjs");
 
-/** 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。 */
-function readNewLines(file, cursor) {
-  const size = fs.statSync(file).size;
+/**
+ * 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。
+ * `until` 给上界（用于 carry 的区间读，见 flushCarry）；缺省读到文件末尾。
+ */
+function readNewLines(file, cursor, until) {
+  const size = Math.min(until ?? Infinity, fs.statSync(file).size);
   if (size <= cursor) return { lines: [], nextCursor: cursor };
   const fd = fs.openSync(file, "r");
   try {
@@ -422,6 +425,46 @@ async function handleSubagent(input, main) {
   );
 }
 
+/**
+ * 收上一条 trace 交界时未落盘的尾巴（state.carry 由 user-prompt-submit 在铸造/停用时记下）。
+ *
+ * 成因：Stop 读 transcript 时，本轮收尾那几行（通常正是产出结论的 assistant 行）往往还没落盘；
+ * 而下一条 trace 铸造时游标跳到交界处，那几行就永久没人合成——实测每条 trace 恒定丢最后一轮的
+ * llm span（token 计数最有价值的那条）。字节级证据：cursor=8292 / 文件 10906，8292–10672
+ * 那两行带完整 usage 的 assistant 一直没被读到。
+ *
+ * 按 carry 里记的**旧** trace_id / root_span_id 补合成，区间上界是交界时刻的文件大小，
+ * 所以绝不会把新一轮的内容错记到旧 trace 上。收完即清（不重试第二次——本地 JSONL 才是真相源）。
+ * 返回是否动过 state（调用方据此决定要不要写盘）。
+ */
+async function flushCarry(input, state) {
+  const c = state.carry;
+  if (!c) return false;
+  delete state.carry;
+  const transcript = c.transcript_path ?? input.transcript_path ?? state.transcript_path;
+  if (!c.trace_id || !transcript || !(c.to > c.from)) return true;
+
+  const { lines } = readNewLines(transcript, c.from, c.to);
+  if (!lines.length) return true;
+
+  const { spans } = synthesize({
+    lines,
+    traceId: c.trace_id,
+    sessionId: c.session_id ?? state.session_id,
+    parentId: c.root_span_id,
+    mlApp: c.ml_app,
+    pendingToolUses: new Map(Object.entries(c.pending_tool_uses ?? {})),
+    lastEntryTs: c.last_entry_ts ?? null,
+    agent: null,
+    ctxBuf: "", // 收尾批不再滚上下文：input_local 由那条 trace 已发出的 llm span 覆盖
+  });
+  if (!spans.length) return true;
+
+  const pending = await emit(spans, []);
+  state.pending_spans = [...pendingIds(state.pending_spans), ...pending];
+  return true;
+}
+
 /** Stop：读主 transcript，合成本轮 llm/tool span，并合成/刷新 root agent span。 */
 async function handleMain(input, state) {
   const transcript = input.transcript_path ?? state.transcript_path;
@@ -492,9 +535,20 @@ async function handleMain(input, state) {
 run(async () => {
   const input = await readStdinJson();
   const state = readState(input.session_id);
-  // 无 trace 归属或本轮未触发（DBDOG_OBS_MODE 触发门）→ 不产 span、不上报
-  if (!state?.trace_id || state.active === false) return;
+  if (!state?.trace_id) return; // 无 trace 归属 → 不产 span、不上报
 
-  if (input.hook_event_name === "SubagentStop") await handleSubagent(input, state);
-  else await handleMain(input, state);
+  if (input.hook_event_name === "SubagentStop") {
+    if (state.active === false) return; // 触发门（DBDOG_OBS_MODE）
+    await handleSubagent(input, state);
+    return;
+  }
+
+  // 交界收尾先做：state.active 已经是 false 也要收——那正是"换了话题"的情形，
+  // 旧 trace 的最后一轮 llm span 就藏在 carry 区间里。收完即止，不产新 span。
+  const flushed = await flushCarry(input, state);
+  if (state.active === false) {
+    if (flushed) writeState(input.session_id, state);
+    return;
+  }
+  await handleMain(input, state);
 });
