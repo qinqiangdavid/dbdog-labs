@@ -18,7 +18,13 @@
 //   └─ tool span "Agent"        父侧调用，span_id = derive(trace_id, agent_id)
 //      └─ 子代理的 llm/tool span  parent_id = 同一个派生值
 // 输出追加到 spans.jsonl。root span 可能随多次 Stop 重发（同 span_id），读侧按"后写赢"去重。
-import crypto from "node:crypto";
+//
+// 2026-08-12 span_id 全面幂等派生：每条 span 的 id 都由 (trace_id, transcript 里的稳定锚)
+// 派生——tool 锚 tool_use_id、llm 锚 entry.uuid、子代理锚 agent_id。原先 llm/tool 用
+// randomBytes，同一批行被合成两遍（实测成因：同一 Stop 事件被 settings.json 与 plugin
+// 各注册一遍，两个进程并行读到同一份未推进的 cursor）就会产出两条不同键的 span，
+// ReplacingMergeTree 按 (trace_id, ts, span_id) 折不掉，控制台上每条都显示两遍。
+// 派生后重复合成天然收敛为"后写赢"，与 root/子代理 span 一致。
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -192,7 +198,16 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
           // 新组的时长近似起点 = 组首行之前那条 entry 的落盘时刻（通常是触发本次
           // 模型调用的 user/tool_result 行）。transcript 无请求发起时刻，这是下批近似。
           // ctxSnapshot 取在本行内容入缓冲之前 = "该轮模型调用实际看到的上下文"。
-          cur = { rid, entries: [entry], startTs: lastEntryTs, ctxSnapshot: ctx };
+          // anchor = span_id 的派生锚：优先 entry.uuid（实测每行都有，且跨进程稳定），
+          // 退 requestId，再退行号（行号是 cursor 相对的，只在"同一 cursor 重复合成"
+          // 这个场景里稳——那正是双注册的情形，够用）。
+          cur = {
+            rid,
+            anchor: entry.uuid ?? entry.requestId ?? `line-${i}`,
+            entries: [entry],
+            startTs: lastEntryTs,
+            ctxSnapshot: ctx,
+          };
           groups.push(cur);
         }
       }
@@ -219,9 +234,11 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
         // 加 "tool:" 前缀是为了跟子代理自己的 agent span 区分开（两者都由 agent_id 派生）。
         const result = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult : null;
         const subAgentId = result?.agentId ?? null;
+        // 普通工具也走派生（锚 tool_use_id，全局唯一且在 transcript 里就有）：
+        // 随机 id 会让"同一批行被合成两遍"变成两条不同键的 span，读侧折不掉。
         const spanId = subAgentId
           ? deriveSpanId(traceId, `tool:${subAgentId}`)
-          : crypto.randomBytes(8).toString("hex");
+          : deriveSpanId(traceId, `tool_use:${b.tool_use_id}`);
 
         // 子代理的总开销：toolUseResult 里现成就有，不打上去等于白扔——有了它们，
         // 不展开子树就能看出这个子代理烧了多少。走 tags（字符串）而非 tokens_* 一等
@@ -283,7 +300,7 @@ function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUse
     const duration = msBetween(g.startTs, last.timestamp);
     spans.push({
       trace_id: traceId,
-      span_id: crypto.randomBytes(8).toString("hex"),
+      span_id: deriveSpanId(traceId, `llm:${g.anchor}`),
       parent_id: parentId,
       session_id: sessionId,
       kind: "llm",

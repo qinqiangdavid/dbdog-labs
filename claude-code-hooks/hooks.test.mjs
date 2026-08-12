@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -111,6 +112,54 @@ describe("Agent Obs hook trigger", () => {
       dir,
     );
     expect(inactiveOutput).toBe("");
+  });
+
+  // —— 后台子代理的收尾不得被 task-notification 关掉 trace（2026-08-12）——
+  // 实测：一条 trace 起了 4 个子代理，只有 1 个留下了自己的 span。上游 Claude Code 的
+  // Agent 工具是即时返回的后台派发（父侧 tool span 时长只有 2–7ms），子代理跑完靠往会话里
+  // 注入一轮 `<task-notification>` 通知。那一轮同样走 UserPromptSubmit，prompt 不带触发词，
+  // 于是把 trace 置成 active:false，之后 3 个子代理的 SubagentStop 全被 run() 的门挡掉。
+  // 证据：主 transcript 里 origin.kind=task-notification 的四轮，时刻与 state 被置 false 对上；
+  // 唯一活下来的那个子代理，SubagentStop 恰好早于第一条通知。
+  it("注入的 task-notification 一轮不算新提问：不关 trace、不铸新 trace、不动游标", () => {
+    const dir = tempObsDir();
+    runHook("user-prompt-submit.mjs", { session_id: "bg", prompt: "诊断: 起几个子代理", cwd: "/tmp" }, dir);
+    const before = readState(dir, "bg");
+    expect(before.active).toBe(true);
+
+    runHook(
+      "user-prompt-submit.mjs",
+      {
+        session_id: "bg",
+        prompt: "<task-notification>\n<task-id>a8d8919de01bc1437</task-id>\n<status>completed</status>\n</task-notification>",
+        cwd: "/tmp",
+      },
+      dir,
+    );
+
+    const after = readState(dir, "bg");
+    expect(after.active).toBe(true);
+    expect(after.trace_id).toBe(before.trace_id);
+    expect(after.started_at).toBe(before.started_at);
+    expect(after.cursor).toBe(before.cursor);
+  });
+
+  it("宿主若直接给出 origin.kind=task-notification，同样按注入轮处理", () => {
+    const dir = tempObsDir();
+    runHook("user-prompt-submit.mjs", { session_id: "bgo", prompt: "诊断: 起几个子代理", cwd: "/tmp" }, dir);
+    runHook(
+      "user-prompt-submit.mjs",
+      { session_id: "bgo", prompt: "子代理回来了", cwd: "/tmp", origin: { kind: "task-notification" } },
+      dir,
+    );
+    expect(readState(dir, "bgo").active).toBe(true);
+  });
+
+  it("真正不带触发词的用户提问照旧关掉 trace（别把门放松过头）", () => {
+    const dir = tempObsDir();
+    runHook("user-prompt-submit.mjs", { session_id: "plainoff", prompt: "诊断: first", cwd: "/tmp" }, dir);
+    runHook("user-prompt-submit.mjs", { session_id: "plainoff", prompt: "顺便说下天气", cwd: "/tmp" }, dir);
+    expect(readState(dir, "plainoff").active).toBe(false);
   });
 });
 
@@ -1061,6 +1110,110 @@ describe("父侧 Agent span 带上子代理的聚合开销", () => {
       expect(s.tags.agent_id).toBeUndefined();
       expect(s.tags.agent_total_tokens).toBeUndefined();
     }
+  });
+});
+
+// —— span_id 幂等派生（2026-08-12）——
+// 症状：控制台每条 llm / tool 都显示两遍。实测根因是同一个 Stop 事件被注册了两遍
+// （用户 settings.json 手工注册 + 已启用 plugin 各一份），两个 hook 进程并行跑、
+// 读到同一份还没推进的 state.cursor，于是同一批 transcript 行被各合成一遍。
+// llm/tool span 原先用 crypto.randomBytes 当 span_id，两份成了不同键，
+// ReplacingMergeTree 按 (trace_id, ts, span_id) 折不掉 → 全部翻倍。
+// 反证：root / 子代理 agent span / 带 agentId 的 Agent tool span 本来就用派生 id，
+// 实测那几条恰好一条没重复。
+describe("同一批 transcript 行重复合成必须幂等", () => {
+  /** 两条 llm 回合 + 本地/MCP 工具各一，带 uuid（真实 transcript 每行都有）。 */
+  function idempotencyTranscript(dir) {
+    return writeTranscript(dir, "idem.jsonl", [
+      { type: "user", uuid: "u-0", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+      {
+        type: "assistant",
+        uuid: "u-1",
+        timestamp: T("05.000"),
+        message: {
+          model: "claude-fable-5",
+          usage: { input_tokens: 3, output_tokens: 50 },
+          content: [
+            { type: "text", text: "先看进程" },
+            { type: "tool_use", id: "tu_local", name: "Bash", input: { command: "ls" } },
+            { type: "tool_use", id: "tu_mcp", name: "mcp__dbdog__search_dbdog_logs", input: { query: "x" } },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "u-2",
+        timestamp: T("07.500"),
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tu_local", content: "file1" },
+            { type: "tool_result", tool_use_id: "tu_mcp", content: "log line" },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "u-3",
+        timestamp: T("20.000"),
+        message: { model: "claude-fable-5", usage: { input_tokens: 2, output_tokens: 80 }, content: [{ type: "text", text: "结论如下" }] },
+      },
+    ]);
+  }
+
+  it("并行的第二个 Stop 进程（同一 cursor）产出同键同 ts 的 span，读侧可折叠", () => {
+    const dir = tempObsDir();
+    const transcript = idempotencyTranscript(dir);
+    seedState(dir, "idem", transcript);
+    const statePath = path.join(dir, "idem.json");
+    const staleState = fs.readFileSync(statePath, "utf8"); // 第二个进程读到的那份
+    const input = {
+      session_id: "idem",
+      transcript_path: transcript,
+      hook_event_name: "Stop",
+      last_assistant_message: "结论如下",
+    };
+
+    runHook("stop.mjs", input, dir);
+    const first = readSpans(dir);
+    expect(first.filter((s) => s.kind === "llm")).toHaveLength(2);
+    expect(first.filter((s) => s.kind === "tool")).toHaveLength(2);
+
+    // 并行第二份：state 还没被推进，读到的 cursor 与第一份相同
+    fs.writeFileSync(statePath, staleState);
+    runHook("stop.mjs", input, dir);
+    const all = readSpans(dir);
+    const second = all.slice(first.length);
+    expect(second).toHaveLength(first.length); // 确实又合成了一整批
+
+    // 关键：两批逐条同键。ts 也必须一致——它同在 ClickHouse 排序键里，
+    // 只对上 span_id、ts 漂了照样折不掉。
+    const keyOf = (s) => `${s.span_id}|${s.ts}`;
+    expect(new Set(all.map(keyOf)).size).toBe(new Set(first.map(keyOf)).size);
+    expect(new Set(second.map(keyOf))).toEqual(new Set(first.map(keyOf)));
+  });
+
+  it("span_id 由 tool_use_id / entry uuid 派生，同 trace 内不撞键", () => {
+    const dir = tempObsDir();
+    const transcript = idempotencyTranscript(dir);
+    seedState(dir, "derive", transcript);
+    runHook(
+      "stop.mjs",
+      { session_id: "derive", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+    );
+
+    const spans = readSpans(dir);
+    expect(new Set(spans.map((s) => s.span_id)).size).toBe(spans.length);
+    for (const s of spans) expect(s.span_id).toMatch(/^[0-9a-f]{16}$/);
+
+    const traceId = "a".repeat(32);
+    const derive = (key) =>
+      crypto.createHash("sha256").update(`${traceId}:${key}`).digest("hex").slice(0, 16);
+    expect(spans.find((s) => s.name === "Bash").span_id).toBe(derive("tool_use:tu_local"));
+    expect(spans.find((s) => s.name === "search_dbdog_logs").span_id).toBe(derive("tool_use:tu_mcp"));
+    const llm = spans.filter((s) => s.kind === "llm");
+    expect(llm.map((s) => s.span_id)).toEqual([derive("llm:u-1"), derive("llm:u-3")]);
   });
 });
 

@@ -22,6 +22,19 @@ run(async () => {
   // 上一条 trace 的 id、Stop 会把本轮的模型消息合成进上一条 trace（错误归属）。
   const mode = (process.env.DBDOG_OBS_MODE?.trim() || "triggered").toLowerCase();
   const promptText = (typeof input.prompt === "string" ? input.prompt : "").trimStart();
+
+  // —— 注入轮：不是新提问，一律原地返回（2026-08-12）——
+  // 上游 Claude Code 的 Agent 工具是即时返回的后台派发，子代理跑完靠往会话里注入一轮
+  // `<task-notification>` 通知。那一轮同样走 UserPromptSubmit，prompt 自然不带触发词，
+  // 落到下面的未触发分支就把 trace 置成 active:false——而它其实正是**本条 trace** 里
+  // 后台子代理的收尾，此后所有 SubagentStop 都被 run() 的门挡掉，子代理整棵子树消失。
+  // 实测一条 trace 起 4 个子代理只活下来 1 个（唯一那个的 SubagentStop 早于第一条通知）。
+  // 判据：宿主给了 origin.kind 就用它；没给则认 prompt 的 `<task-notification>` 前缀
+  // （实测主 transcript 里该轮 origin.kind=task-notification、正文以此开头）。
+  // 已知残留：用户真发了一条不带触发词的新提问、而后台子代理还没收尾时，那些子代理仍会
+  // 被丢——那种情形下 state 已该归属新一轮，硬留会造成错误归属，另案处理。
+  const injectedKind = typeof input.origin?.kind === "string" ? input.origin.kind : "";
+  if (injectedKind === "task-notification" || promptText.startsWith("<task-notification>")) return;
   const trigger = process.env.DBDOG_OBS_TRIGGER?.trim() || "诊断:";
   // 冒号全半角归一（2026-07-11 用户提出）：中文输入法默认全角「：」，「诊断：」也必须触发；
   // 自定义触发词同样归一后比较，两种冒号都收。
