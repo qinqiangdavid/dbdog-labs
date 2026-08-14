@@ -32,6 +32,7 @@ import {
   cap,
   deriveSpanId,
   lookupSpans,
+  obsDir,
   pendingIds,
   readState,
   readStdinJson,
@@ -44,6 +45,9 @@ import { summaryEnv } from "./summary.mjs";
 
 /** 诊断流程总结 detached worker（与 stop.mjs 用同一个）。 */
 const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-worker.mjs");
+
+/** sweep 收尸脚本（与 session-start.mjs 用同一个）。 */
+const SWEEP = path.join(path.dirname(fileURLToPath(import.meta.url)), "sweep.mjs");
 
 /** 单批上报条数上限（对齐 sweep 的量级；服务端限 1000 条/5MB，留足余量）。 */
 const BATCH = 100;
@@ -265,6 +269,24 @@ run(async () => {
       }).unref();
     } catch {
       /* best-effort：起不来就这次没总结，不影响收尾 */
+    }
+  }
+
+  // 收尾流程末尾顺手排空积压（2026-08-14，owner 拍板）：一串 headless 会话跑完之后
+  // 再无 SessionStart，旧会话卡死的 pending 从此没人补发——47 圈巡检 B 类送达丢失
+  // （168 条横跨 30+ 小时）正是这条触发链断掉。sweep 只碰 idle>2h 的旧状态文件，
+  // 与本会话刚写的文件天然无竞争（本会话自己的 pending 留给之后的 sweep）。
+  try {
+    spawn(process.execPath, [SWEEP], { detached: true, stdio: "ignore" }).unref();
+  } catch (err) {
+    // summary-worker.log 同款留痕：detached + ignore 的黑洞里不能再静默吞一次
+    try {
+      fs.appendFileSync(
+        path.join(obsDir(), "summary-worker.log"),
+        `${new Date().toISOString()} session=${input.session_id} sweep spawn failed: ${err?.message ?? err}\n`,
+      );
+    } catch {
+      /* 留不下就留不下 */
     }
   }
 });

@@ -1695,3 +1695,128 @@ describe("总结失败留痕 + SessionEnd 触发总结", () => {
     expect(sum.ts).toBe(st.started_at ?? sum.ts); // ts 锚在 trace 起点(既有约定)
   });
 });
+
+// —— sweep 排空短板（2026-08-14，owner 拍板最小修）——
+// 47 圈巡检实测:3 个积压文件(213/141/24 条)横跨 30+ 个 SessionStart 反复补发不动——
+// 200 条/批 × 全文 span(input/output 各 8K 字符封顶,最坏 ~3.2MB)骑在 3s 缺省上报
+// 超时上,一批超时→整体留着→下次原样再撞。三点最小修:批量 50、sweep 侧缺省超时 10s、
+// SessionEnd 收尾末尾也排空一次(一串 headless 会话结束后再无 SessionStart,旧积压
+// 从此没人管——正是 B 类送达丢失卡死的触发链)。
+describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => {
+  it("缺省批量 50:120 条积压分 3 批发完", async () => {
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      const ids = Array.from({ length: 120 }, (_, i) => `sp${i}`);
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        ids.map((id) => JSON.stringify({ trace_id: "t", span_id: id, kind: "llm", name: id })).join("\n") + "\n",
+      );
+      const p = writeStateFile(dir, "big50.json", { trace_id: "t", pending_spans: ids });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        // 不配 DBDOG_OBS_SWEEP_BATCH——测的就是缺省值
+      });
+
+      expect(sink.received).toHaveLength(120);
+      expect(sink.batches).toEqual([50, 50, 20]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("sweep 缺省上报超时放宽:慢 sink(首字节 4s,超旧 3s 缺省)也能排空", async () => {
+    const dir = tempObsDir();
+    // 首字节压 4 秒的 sink:旧缺省 3s 必 abort,pending 永远排不空(实测症状同款)
+    const received = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        setTimeout(() => {
+          try { received.push(...JSON.parse(body).spans); } catch {}
+          res.writeHead(202, { "content-type": "application/json" });
+          res.end("{}");
+        }, 4000);
+      });
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`;
+    try {
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        JSON.stringify({ trace_id: "t1", span_id: "slow1", kind: "llm", name: "x" }) + "\n",
+      );
+      const p = writeStateFile(dir, "slow.json", { trace_id: "t1", pending_spans: ["slow1"] });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        // 不配 DBDOG_OBS_REPORT_TIMEOUT_MS——测的就是 sweep 侧缺省放宽
+      });
+
+      expect(received.map((s) => s.span_id)).toEqual(["slow1"]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual([]);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  }, 15_000);
+
+  it("SessionEnd 收尾流程末尾触发一次排空:旧会话的积压被补发", async () => {
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      // 旧会话:pending 卡死、状态文件早已 idle
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        JSON.stringify({ trace_id: "told", span_id: "stuck1", kind: "llm", name: "x" }) + "\n",
+      );
+      const pOld = writeStateFile(dir, "old.json", { trace_id: "told", pending_spans: ["stuck1"] });
+      ageFile(pOld, 3 * HOUR);
+
+      // 当前会话:正常收尾(无尾巴可补,纯触发 sweep)
+      const tr = writeTranscript(dir, "cur.jsonl", [
+        { type: "user", uuid: "u", timestamp: T("00.000"), message: { role: "user", content: "诊断: q" } },
+      ]);
+      writeStateFile(dir, "cur.json", {
+        active: true,
+        trace_id: "e".repeat(32),
+        root_span_id: "e".repeat(16),
+        session_id: "cur",
+        transcript_path: tr,
+        cursor: fs.statSync(tr).size, // 游标已在 EOF → 本会话自己无span 可补
+        started_at: "2026-07-15T00:00:00.000Z",
+      });
+
+      runHook(
+        "session-end.mjs",
+        { session_id: "cur", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" },
+        dir,
+        {
+          DBDOG_OBS_REPORT_URL: sink.url,
+          DBDOG_OBS_API_KEY: "k",
+          DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        },
+      );
+
+      // sweep 是 detached 后台进程,轮询等它排空
+      const t0 = Date.now();
+      let drained = false;
+      while (Date.now() - t0 < 4000 && !drained) {
+        drained = JSON.parse(fs.readFileSync(pOld, "utf8")).pending_spans?.length === 0;
+        if (!drained) await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(drained, "SessionEnd 后 4s 内旧积压应被排空").toBe(true);
+      expect(sink.received.map((s) => s.span_id)).toEqual(["stuck1"]);
+    } finally {
+      await sink.close();
+    }
+  });
+});
