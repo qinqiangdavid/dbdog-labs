@@ -276,8 +276,10 @@ export async function generateSummary(messages, env) {
     });
 
   let res = await post({ ...base, thinking: { type: "disabled" } });
-  if (!res.ok && res.status >= 400 && res.status < 500) {
-    // 老兼容端点不认 thinking 字段 → 去掉重试一次（幂等只读调用，重试无副作用）
+  if (!res.ok && res.status === 400) {
+    // 老兼容端点不认 thinking 字段 → 去掉重试一次（幂等只读调用，重试无副作用）。
+    // 只对 400（bad request，"不认这个字段"一类）：401/403 重试无意义，
+    // 429 重试是给限流火上浇油（codex 复审反例:双发）。
     res = await post(base);
   }
   if (!res.ok) {

@@ -81,8 +81,13 @@ export const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
  * @param parentId  本批 span 挂的父节点（主线=root span；子代理=父侧 Agent tool span 的派生 id）
  * @param agent     非空表示正在处理子代理那份 transcript，span 上补 agent_id/agent_type
  * @param ctxBuf    上一批带来的滚动上下文缓冲（每轮 prompt 从这里截）
+ * @param partialLlm 上一批尾组的延续信息（2026-08-14 codex 复审阻断项:同一 requestId 的
+ *   多条 assistant 行被 Stop/SessionEnd 拆成两批读时,第二批若各自成组、用自己的 uuid 派生
+ *   span_id,就是两条不同键的 llm span——usage 是逐行全量重复的,token 直接双计。
+ *   延续信息 {rid, anchor, ts, start_ts, output}:第二批的首组若 requestId 与 rid 相同,
+ *   复用 anchor(同 span_id)与 ts(同排序键,后写赢真正折叠),output 前拼上前半段。）
  */
-export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent, ctxBuf }) {
+export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent, ctxBuf, partialLlm }) {
   const spans = [];
   const agentTags = agent ? { agent_id: agent.id, ...(agent.type ? { agent_type: agent.type } : {}) } : {};
   // 子代理 agent span 的 ts 与 input：实测子代理 transcript 首行即 type=user、
@@ -160,13 +165,27 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
           // anchor = span_id 的派生锚：优先 entry.uuid（实测每行都有，且跨进程稳定），
           // 退 requestId，再退行号（行号是 cursor 相对的，只在"同一 cursor 重复合成"
           // 这个场景里稳——那正是双注册的情形，够用）。
-          cur = {
-            rid,
-            anchor: entry.uuid ?? entry.requestId ?? `line-${i}`,
-            entries: [entry],
-            startTs: lastEntryTs,
-            ctxSnapshot: ctx,
-          };
+          // 跨批延续:本批首组与上一批尾组同 requestId → 是同一次模型调用被批界拆开,
+          // 身份(anchor/ts)必须沿用上一批已发出的那条 span,重发全量、后写赢。
+          const cont =
+            groups.length === 0 && partialLlm && entry.requestId && partialLlm.rid === entry.requestId;
+          cur = cont
+            ? {
+                rid,
+                anchor: partialLlm.anchor,
+                entries: [entry],
+                startTs: partialLlm.start_ts ?? null,
+                ctxSnapshot: ctx,
+                tsOverride: partialLlm.ts ?? null,
+                carriedOutput: partialLlm.output ?? "",
+              }
+            : {
+                rid,
+                anchor: entry.uuid ?? entry.requestId ?? `line-${i}`,
+                entries: [entry],
+                startTs: lastEntryTs,
+                ctxSnapshot: ctx,
+              };
           groups.push(cur);
         }
       }
@@ -257,6 +276,12 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
     // ts 用同一基线（startTs）——否则 ts=首行落盘 + duration=从前一条起算，
     // span 终点会越过 root 终点（0.2.0 实测 39s 过冲）。
     const duration = msBetween(g.startTs, last.timestamp);
+    const emittedTs =
+      g.tsOverride ?? (duration != null ? g.startTs : first.timestamp) ?? new Date().toISOString();
+    const newText = g.entries.map((e) => assistantText(e.message?.content)).filter(Boolean).join("\n");
+    const emittedOutput = g.carriedOutput ? `${g.carriedOutput}\n${newText}` : newText;
+    g.emittedTs = emittedTs;
+    g.emittedOutput = emittedOutput;
     spans.push({
       trace_id: traceId,
       span_id: deriveSpanId(traceId, `llm:${g.anchor}`),
@@ -266,13 +291,13 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       name: "anthropic.messages",
       model: msg.model ?? null,
       status: "ok",
-      ts: (duration != null ? g.startTs : first.timestamp) ?? new Date().toISOString(),
+      ts: emittedTs,
       duration_ms: duration,
       input: null, // 上报侧恒 null：远端只看 token；完整 prompt 走 input_local 纯本地
       // input_local：该轮模型调用实际看到的上下文（截尾，contentCap 控制长度）。
       // 开关 DBDOG_OBS_STORE_LLM_INPUT=0 可关；只在 spans.jsonl，reportSpans 前剥离。
       ...(storeLlmInput() ? { input_local: capTail(g.ctxSnapshot ?? "") } : {}),
-      output: cap(g.entries.map((e) => assistantText(e.message?.content)).filter(Boolean).join("\n")),
+      output: cap(emittedOutput),
       tokens_input: msg.usage.input_tokens ?? null,
       tokens_output: msg.usage.output_tokens ?? null,
       tokens_cache_read: msg.usage.cache_read_input_tokens ?? null,
@@ -288,5 +313,20 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
     });
   }
 
-  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf: ctx };
+  // 尾组延续信息：只有带真实 requestId 的组才可能被批界拆开（无 requestId 的行各自成组、
+  // 行本身不可再分——readNewLines 只消费完整行）。output 截尾防状态膨胀（cap 足够：
+  // 上报侧 output 本就 cap）。
+  let partialOut = null;
+  const tail = groups[groups.length - 1];
+  if (tail && tail.entries[0].requestId) {
+    partialOut = {
+      rid: tail.rid,
+      anchor: tail.anchor,
+      ts: tail.emittedTs,
+      start_ts: tail.startTs ?? null,
+      output: cap(tail.emittedOutput ?? ""),
+    };
+  }
+
+  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf: ctx, partialLlm: partialOut };
 }

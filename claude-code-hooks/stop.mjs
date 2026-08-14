@@ -77,7 +77,7 @@ async function handleSubagent(input, main) {
   const selfSpanId = deriveSpanId(main.trace_id, agentId);
   const parentToolSpanId = deriveSpanId(main.trace_id, `tool:${agentId}`);
 
-  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf, partialLlm } = synthesize({
     lines,
     traceId: main.trace_id,
     sessionId: main.session_id ?? input.session_id,
@@ -87,6 +87,7 @@ async function handleSubagent(input, main) {
     lastEntryTs: sub.last_entry_ts ?? null,
     agent: { id: agentId, type: input.agent_type ?? null },
     ctxBuf: sub.ctx_buf ?? "",
+    partialLlm: sub.partial_llm ?? null,
   });
 
   // 子代理自己的 agent span（一个自治单元 = 一条 agent span，便于按 kind 数出
@@ -131,6 +132,10 @@ async function handleSubagent(input, main) {
       prompt: prompt ?? null,
       pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
       ctx_buf: ctxBuf,
+      // trace 归属固化（codex 复审阻断项）：SessionEnd 收尾时只认归属当前 trace 的子代理，
+      // 不把上一条 trace 的子代理尾巴错挂进来。
+      trace_id: main.trace_id,
+      partial_llm: partialLlm ?? null,
     },
     agentId,
   );
@@ -168,6 +173,7 @@ async function flushCarry(input, state) {
     lastEntryTs: c.last_entry_ts ?? null,
     agent: null,
     ctxBuf: "", // 收尾批不再滚上下文：input_local 由那条 trace 已发出的 llm span 覆盖
+    partialLlm: c.partial_llm ?? null,
   });
   if (!spans.length) return true;
 
@@ -182,7 +188,7 @@ async function handleMain(input, state) {
   if (!transcript) return;
 
   const { lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0);
-  const { spans, pendingToolUses, lastEntryTs, ctxBuf } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, ctxBuf, partialLlm } = synthesize({
     lines,
     traceId: state.trace_id,
     sessionId: state.session_id,
@@ -192,6 +198,7 @@ async function handleMain(input, state) {
     lastEntryTs: state.last_entry_ts ?? null,
     agent: null,
     ctxBuf: state.ctx_buf ?? "",
+    partialLlm: state.partial_llm ?? null,
   });
   // 本轮新增的工具调用数（= 诊断有新进展的信号；纯 Q&A 回合无新工具，不触发总结重算）。
   const newToolCount = spans.filter((s) => s.kind === "tool").length;
@@ -223,6 +230,7 @@ async function handleMain(input, state) {
   state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
   state.ctx_buf = ctxBuf;
+  state.partial_llm = partialLlm ?? null;
   state.pending_tool_uses = Object.fromEntries(
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),
   );
@@ -233,10 +241,12 @@ async function handleMain(input, state) {
   // 失败必须吞掉——spawn 不得打断会话。
   if (newToolCount > 0 && summaryEnv()) {
     try {
-      spawn(process.execPath, [WORKER, input.session_id], {
+      const child = spawn(process.execPath, [WORKER, input.session_id], {
         detached: true,
         stdio: "ignore",
-      }).unref();
+      });
+      child.once("error", () => {}); // spawn 的运行期失败走异步 error 事件,不接住会崩掉 hook
+      child.unref();
     } catch {
       /* best-effort：起不来就这次没总结，不影响 trace */
     }

@@ -1576,16 +1576,19 @@ describe("SessionEnd 收尾：会话直接结束不丢尾", () => {
 //    总结吃到的是完整 trace（Stop 时刻的 spawn 保持不动，读侧同键后写赢）。
 describe("总结失败留痕 + SessionEnd 触发总结", () => {
   function startStub(payload, status = 200) {
+    const bodies = [];
     const server = http.createServer((req, res) => {
-      req.on("data", () => {});
+      let body = "";
+      req.on("data", (d) => (body += d));
       req.on("end", () => {
+        try { bodies.push(JSON.parse(body)); } catch {}
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(payload));
       });
     });
     return new Promise((r) =>
       server.listen(0, "127.0.0.1", () =>
-        r({ baseUrl: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((c) => server.close(c)) }),
+        r({ baseUrl: `http://127.0.0.1:${server.address().port}`, bodies, close: () => new Promise((c) => server.close(c)) }),
       ),
     );
   }
@@ -1693,6 +1696,10 @@ describe("总结失败留痕 + SessionEnd 触发总结", () => {
     const sum = readSpans(dir).find((s) => s.kind === "workflow");
     expect(sum.output).toBe("SessionEnd 之后的总结。");
     expect(sum.ts).toBe(st.started_at ?? sum.ts); // ts 锚在 trace 起点(既有约定)
+    // codex 复审反例:光出 workflow span 不够——重算的意义是事实表里有尾部结论。
+    // trimSpans 只读 agent/tool 证据,所以尾部结论必须先进 root output(SessionEnd 刷新)。
+    const factBodies = JSON.stringify(llm.bodies);
+    expect(factBodies, "发给模型的事实表必须包含尾部结论").toContain("根因在 X");
   });
 });
 
@@ -1719,7 +1726,9 @@ describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => 
         DBDOG_OBS_REPORT_URL: sink.url,
         DBDOG_OBS_API_KEY: "k",
         DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
-        // 不配 DBDOG_OBS_SWEEP_BATCH——测的就是缺省值
+        // 显式置空:宿主 shell 若真配着这些 env,继承下来会假绿(codex 审查项)
+        DBDOG_OBS_SWEEP_BATCH: "",
+        DBDOG_OBS_REPORT_TIMEOUT_MS: "",
       });
 
       expect(sink.received).toHaveLength(120);
@@ -1759,7 +1768,9 @@ describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => 
         DBDOG_OBS_REPORT_URL: url,
         DBDOG_OBS_API_KEY: "k",
         DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
-        // 不配 DBDOG_OBS_REPORT_TIMEOUT_MS——测的就是 sweep 侧缺省放宽
+        // 显式置空:测的就是 sweep 侧缺省;宿主 env 继承会假绿(codex 审查项)
+        DBDOG_OBS_SWEEP_BATCH: "",
+        DBDOG_OBS_REPORT_TIMEOUT_MS: "",
       });
 
       expect(received.map((s) => s.span_id)).toEqual(["slow1"]);
@@ -1793,6 +1804,7 @@ describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => 
         transcript_path: tr,
         cursor: fs.statSync(tr).size, // 游标已在 EOF → 本会话自己无span 可补
         started_at: "2026-07-15T00:00:00.000Z",
+        root_emitted: true, // 正常 Stop 过的会话,root 已落——SessionEnd 不再补
       });
 
       runHook(
@@ -1806,17 +1818,306 @@ describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => 
         },
       );
 
-      // sweep 是 detached 后台进程,轮询等它排空
+      // sweep 是 detached 后台进程,轮询等它排空(容忍与 writeFileSync 撞车的瞬时读损)
       const t0 = Date.now();
       let drained = false;
-      while (Date.now() - t0 < 4000 && !drained) {
-        drained = JSON.parse(fs.readFileSync(pOld, "utf8")).pending_spans?.length === 0;
+      while (Date.now() - t0 < 8000 && !drained) {
+        try {
+          drained = JSON.parse(fs.readFileSync(pOld, "utf8")).pending_spans?.length === 0;
+        } catch {
+          /* 撞上非原子写,当没排空继续等 */
+        }
         if (!drained) await new Promise((r) => setTimeout(r, 100));
       }
-      expect(drained, "SessionEnd 后 4s 内旧积压应被排空").toBe(true);
+      expect(drained, "SessionEnd 后 8s 内旧积压应被排空").toBe(true);
       expect(sink.received.map((s) => s.span_id)).toEqual(["stuck1"]);
     } finally {
       await sink.close();
     }
+  }, 15_000);
+
+  it("显式配置的上报超时不被 sweep 的 10s 缺省覆盖", async () => {
+    const dir = tempObsDir();
+    // 首字节压 2s 的 sink;显式配 500ms 超时 → 必须失败、pending 保留
+    const server = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => setTimeout(() => { res.writeHead(202); res.end("{}"); }, 2000));
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        JSON.stringify({ trace_id: "t1", span_id: "keep1", kind: "llm", name: "x" }) + "\n",
+      );
+      const p = writeStateFile(dir, "expl.json", { trace_id: "t1", pending_spans: ["keep1"] });
+      ageFile(p, 3 * HOUR);
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        DBDOG_OBS_REPORT_TIMEOUT_MS: "500", // 用户显式配的,sweep 不得动
+      });
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["keep1"]);
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  }, 15_000);
+});
+
+// —— codex 复审阻断项修复（2026-08-14 第二轮对抗）——
+// 接受的六项:①无 Stop 的会话 root 缺失(残树) ②尾部结论进不了重算总结(root 不刷新,
+// 而 trimSpans 只读 agent/tool 证据) ③requestId 跨批归并断裂(span 重复+token 双计)
+// ④SessionEnd 把历史/别的 trace 的子代理错挂到当前 trace ⑤SessionEnd 用空文本近似
+// 覆盖 SubagentStop 的权威 agent span ⑥summary 竞态(旧 worker 后写覆盖)与上报失败
+// 既不落 pending 也不留痕。
+describe("codex 复审阻断项", () => {
+  it("无 Stop 直接 SessionEnd:root 补出来,子 span 不再是孤儿", () => {
+    const dir = tempObsDir();
+    const tr = path.join(dir, "nostop.jsonl"); // 先 mint(文件尚不存在,游标从 0 起)
+    runHook("user-prompt-submit.mjs", { session_id: "ns", prompt: "诊断: 为何慢", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "ns");
+    // Stop 从未发生(API 错误/用户中断),整轮内容都在"尾巴"里
+    writeTranscript(dir, "nostop.jsonl", [
+      { type: "user", uuid: "u1", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为何慢" } },
+      {
+        type: "assistant", uuid: "a1", timestamp: T("05.000"),
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 2 }, content: [{ type: "text", text: "根因在 X。" }] },
+      },
+    ]);
+    runHook("session-end.mjs", { session_id: "ns", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const spans = readSpans(dir).filter((s) => s.trace_id === st.trace_id);
+    const root = spans.find((s) => s.span_id === st.root_span_id);
+    expect(root, "root 必须补出来,否则整树是孤儿").toBeTruthy();
+    expect(root.kind).toBe("agent");
+    expect(root.input).toContain("诊断: 为何慢");
+    expect(root.output).toContain("根因在 X");
+    expect(root.ts).toBe(st.started_at); // ts 锚 trace 起点,与 Stop 的 root 同键可折叠
+    const llm = spans.filter((s) => s.kind === "llm");
+    expect(llm).toHaveLength(1);
+    expect(llm[0].parent_id).toBe(st.root_span_id);
+  });
+
+  it("requestId 跨 Stop/SessionEnd 批不断裂:同 span_id 同 ts,token 不双计", () => {
+    const dir = tempObsDir();
+    const tr = path.join(dir, "split.jsonl");
+    runHook("user-prompt-submit.mjs", { session_id: "sp", prompt: "诊断: q", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "sp");
+    writeTranscript(dir, "split.jsonl", [
+      { type: "user", uuid: "u1", timestamp: T("00.000"), message: { role: "user", content: "诊断: q" } },
+      {
+        type: "assistant", uuid: "a1", requestId: "req_split", timestamp: T("01.000"),
+        message: { model: "m", usage: { input_tokens: 10, output_tokens: 20 }, content: [{ type: "text", text: "part1" }] },
+      },
+    ]);
+    runHook("stop.mjs", { session_id: "sp", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "…" }, dir);
+    // 同一响应(同 requestId)的后半行在 Stop 之后才落盘——正是收尾要处理的时序
+    fs.appendFileSync(
+      tr,
+      JSON.stringify({
+        type: "assistant", uuid: "a2", requestId: "req_split", timestamp: T("02.000"),
+        message: { model: "m", usage: { input_tokens: 10, output_tokens: 20 }, content: [{ type: "text", text: "part2" }] },
+      }) + "\n",
+    );
+    runHook("session-end.mjs", { session_id: "sp", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const llmRows = readSpans(dir).filter((s) => s.kind === "llm" && s.trace_id === st.trace_id);
+    expect(llmRows).toHaveLength(2); // 本地 JSONL 两行是正常的(后写赢)
+    expect(new Set(llmRows.map((s) => s.span_id)).size, "同一 requestId 必须同 span_id").toBe(1);
+    expect(new Set(llmRows.map((s) => s.ts)).size, "ts 也必须一致,否则排序键折不掉").toBe(1);
+    const last = llmRows[llmRows.length - 1];
+    expect(last.tokens_output).toBe(20); // usage 是全量重复,不是增量——只算一次
+    expect(last.output).toContain("part1");
+    expect(last.output).toContain("part2");
+  });
+
+  it("旧话题的子代理(无状态文件、trace 开始前已停笔)不挂进当前 trace", () => {
+    const dir = tempObsDir();
+    const tr = path.join(dir, "oldsub.jsonl");
+    // 先落一个"历史子代理"的 transcript,mtime 拨老
+    const subDir = path.join(dir, "os", "subagents");
+    fs.mkdirSync(subDir, { recursive: true });
+    const oldAgent = "aold000000000001";
+    const subPath = path.join(subDir, `agent-${oldAgent}.jsonl`);
+    fs.writeFileSync(
+      subPath,
+      JSON.stringify({
+        type: "assistant", uuid: "os-a", timestamp: "2026-07-14T00:00:00.000Z",
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: "text", text: "旧话题产物" }] },
+      }) + "\n",
+    );
+    ageFile(subPath, 3 * HOUR);
+    // 之后才铸的新 trace
+    runHook("user-prompt-submit.mjs", { session_id: "os", prompt: "诊断: 新问题", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "os");
+    runHook("session-end.mjs", { session_id: "os", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    // 守卫生效时本会话零 span,spans.jsonl 可能根本没创建——无文件即零
+    const all = fs.existsSync(path.join(dir, "spans.jsonl")) ? readSpans(dir) : [];
+    const wrong = all.filter((s) => s.trace_id === st.trace_id && s.tags?.agent_id === oldAgent);
+    expect(wrong, "trace 开始前就停笔的子代理不属于本 trace").toHaveLength(0);
+  });
+
+  it("SubagentStop 把 trace 归属写进子代理状态;SessionEnd 尊重它,不吞别的 trace 的子代理", () => {
+    const dir = tempObsDir();
+    const tr = path.join(dir, "attr.jsonl");
+    runHook("user-prompt-submit.mjs", { session_id: "at", prompt: "诊断: q", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "at");
+    const subDir = path.join(dir, "at", "subagents");
+    fs.mkdirSync(subDir, { recursive: true });
+    const agentId = "aattr00000000001";
+    const at = path.join(subDir, `agent-${agentId}.jsonl`);
+    fs.writeFileSync(
+      at,
+      JSON.stringify({ type: "user", uuid: "s-u", timestamp: T("01.000"), message: { role: "user", content: "去查" } }) + "\n" +
+      JSON.stringify({
+        type: "assistant", uuid: "s-a", timestamp: T("02.000"),
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: "text", text: "查到了" }] },
+      }) + "\n",
+    );
+    runHook(
+      "stop.mjs",
+      { session_id: "at", hook_event_name: "SubagentStop", agent_id: agentId, agent_transcript_path: at, transcript_path: tr, last_assistant_message: "查到了" },
+      dir,
+    );
+    const sub = JSON.parse(fs.readFileSync(path.join(dir, `at.${agentId}.json`), "utf8"));
+    expect(sub.trace_id, "SubagentStop 必须固化 trace 归属").toBe(st.trace_id);
+
+    // 篡改归属模拟"上一条 trace 的子代理"(状态在、trace 不同),再追加新行
+    sub.trace_id = "f".repeat(32);
+    fs.writeFileSync(path.join(dir, `at.${agentId}.json`), JSON.stringify(sub));
+    fs.appendFileSync(
+      at,
+      JSON.stringify({
+        type: "assistant", uuid: "s-b", timestamp: T("03.000"),
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: "text", text: "尾行" }] },
+      }) + "\n",
+    );
+    runHook("session-end.mjs", { session_id: "at", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+    const stolen = readSpans(dir).filter(
+      (s) => s.trace_id === st.trace_id && s.tags?.agent_id === agentId && s.output === "尾行",
+    );
+    expect(stolen, "归属别的 trace 的子代理尾巴不得挂进当前 trace").toHaveLength(0);
+  });
+
+  it("SessionEnd 不用空文本覆盖 SubagentStop 已落定的 agent span", () => {
+    const dir = tempObsDir();
+    const tr = path.join(dir, "keep.jsonl");
+    runHook("user-prompt-submit.mjs", { session_id: "kp", prompt: "诊断: q", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const subDir = path.join(dir, "kp", "subagents");
+    fs.mkdirSync(subDir, { recursive: true });
+    const agentId = "akeep00000000001";
+    const at = path.join(subDir, `agent-${agentId}.jsonl`);
+    fs.writeFileSync(
+      at,
+      JSON.stringify({ type: "user", uuid: "k-u", timestamp: T("01.000"), message: { role: "user", content: "去查" } }) + "\n" +
+      JSON.stringify({
+        type: "assistant", uuid: "k-a", timestamp: T("02.000"),
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: "text", text: "结论文本" }] },
+      }) + "\n",
+    );
+    runHook(
+      "stop.mjs",
+      { session_id: "kp", hook_event_name: "SubagentStop", agent_id: agentId, agent_transcript_path: at, transcript_path: tr, last_assistant_message: "权威结论" },
+      dir,
+    );
+    // 尾巴只有一条 user 行——没有任何助手文本可作 output
+    fs.appendFileSync(
+      at,
+      JSON.stringify({ type: "user", uuid: "k-u2", timestamp: T("03.000"), message: { role: "user", content: "补一句" } }) + "\n",
+    );
+    runHook("session-end.mjs", { session_id: "kp", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const agentRows = readSpans(dir).filter((s) => s.kind === "agent" && s.tags?.agent_id === agentId);
+    expect(agentRows, "无新文本就不重发 agent span(后写赢会拿空串覆盖权威 output)").toHaveLength(1);
+    expect(agentRows[0].output).toBe("权威结论");
+  });
+});
+
+// —— summary 代次与送达（codex 复审高危项)——
+describe("summary 代次校验与上报失败留痕", () => {
+  function startStub(payload, status = 200) {
+    const bodies = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        try { bodies.push(JSON.parse(body)); } catch {}
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      });
+    });
+    return new Promise((r) =>
+      server.listen(0, "127.0.0.1", () =>
+        r({ url: `http://127.0.0.1:${server.address().port}`, bodies, close: () => new Promise((c) => server.close(c)) }),
+      ),
+    );
+  }
+  function runWorker(dir, sessionId, extraEnv) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HOOK_DIR, "summary-worker.mjs"), sessionId], {
+        env: {
+          ...process.env,
+          DBDOG_OBS_DIR: dir,
+          DBDOG_OBS_SPANS: path.join(dir, "spans.jsonl"),
+          DBDOG_OBS_REPORT_URL: "",
+          DBDOG_OBS_API_KEY: "",
+          ...extraEnv,
+        },
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve(code));
+    });
+  }
+  const TRACE = "9".repeat(32);
+  function seed(dir, sessionId) {
+    fs.writeFileSync(
+      path.join(dir, `${sessionId}.json`),
+      JSON.stringify({ active: true, trace_id: TRACE, root_span_id: TRACE.slice(0, 16), session_id: sessionId, started_at: "2026-07-15T00:00:00.000Z" }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "spans.jsonl"),
+      JSON.stringify({ trace_id: TRACE, span_id: TRACE.slice(0, 16), kind: "agent", ts: "2026-07-15T00:00:01.000Z", output: "结论" }) + "\n",
+    );
+  }
+
+  it("代次校验:更高水位的总结已写,旧快照 worker 丢弃自己的结果", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "旧快照总结" }], usage: {} });
+    seed(dir, "gen");
+    // 别的 worker 已按更高水位(999 条 span)写过总结
+    fs.writeFileSync(path.join(dir, `${TRACE}.summary-gen.json`), JSON.stringify({ watermark: 999 }));
+    try {
+      await runWorker(dir, "gen", { DBDOG_SUMMARY_LLM_BASE_URL: llm.url, DBDOG_SUMMARY_LLM_API_KEY: "k" });
+    } finally {
+      await llm.close();
+    }
+    const sums = readSpans(dir).filter((s) => s.kind === "workflow");
+    expect(sums, "旧快照(水位 1)不得覆盖更完整的总结(水位 999)").toHaveLength(0);
+  });
+
+  it("上报失败:span_id 进主状态 pending_spans + summary-worker.log 留痕", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "正文" }], usage: {} });
+    const sink = await startStub({}, 500); // 上报端点恒 500
+    seed(dir, "rf");
+    try {
+      await runWorker(dir, "rf", {
+        DBDOG_SUMMARY_LLM_BASE_URL: llm.url,
+        DBDOG_SUMMARY_LLM_API_KEY: "k",
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+      });
+    } finally {
+      await llm.close();
+      await sink.close();
+    }
+    const sums = readSpans(dir).filter((s) => s.kind === "workflow");
+    expect(sums).toHaveLength(1); // 本地真相源照落
+    const st = JSON.parse(fs.readFileSync(path.join(dir, "rf.json"), "utf8"));
+    expect(st.pending_spans).toContain(sums[0].span_id); // sweep 之后能救
+    const log = fs.readFileSync(path.join(dir, "summary-worker.log"), "utf8");
+    expect(log).toContain("rf");
+    expect(log).toMatch(/report|上报/);
   });
 });

@@ -266,3 +266,24 @@ describe("generateSummary · 推理模型兼容", () => {
     expect(calls[1].thinking).toBeUndefined();
   });
 });
+
+// codex 复审:4xx 全重试太宽——429(限流)双发是火上浇油;401/403 重试也无意义。
+// thinking 字段的降级只针对 400(bad request,"不认这个字段"那一类)。
+describe("generateSummary · thinking 降级只对 400", () => {
+  it("429 不重试:只打一次就抛", async () => {
+    Object.assign(process.env, baseEnv);
+    const env = summaryEnv();
+    const calls = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      calls.push(JSON.parse(init.body));
+      return new Response("rate limited", { status: 429 });
+    };
+    try {
+      await expect(generateSummary(buildPrompt("x"), env)).rejects.toThrow(/HTTP 429/);
+    } finally {
+      globalThis.fetch = orig;
+    }
+    expect(calls).toHaveLength(1);
+  });
+});
