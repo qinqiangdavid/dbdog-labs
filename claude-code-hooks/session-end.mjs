@@ -19,8 +19,14 @@
 //
 // 上报分批（每批 ≤100）：收尾批可能有几百条（in-flight 子代理整棵），单发大包会
 // 骑在 3s 超时上；失败的照旧记 pending_spans，留给下一次 sweep。
+//
+// ④ 收尾出了新 span 就再触发一次诊断总结（detached，同 stop.mjs）——此时尾部结论
+//    span 已补齐，总结吃到的是完整 trace。Stop 时刻的 spawn 保持不动：两个 worker
+//    产同键同 ts 的 workflow span，读侧后写赢，互不打架。
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   appendSpans,
   cap,
@@ -34,6 +40,10 @@ import {
   writeState,
 } from "./lib.mjs";
 import { PENDING_TOOL_USE_MAX, msBetween, readNewLines, synthesize } from "./synthesize.mjs";
+import { summaryEnv } from "./summary.mjs";
+
+/** 诊断流程总结 detached worker（与 stop.mjs 用同一个）。 */
+const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-worker.mjs");
 
 /** 单批上报条数上限（对齐 sweep 的量级；服务端限 1000 条/5MB，留足余量）。 */
 const BATCH = 100;
@@ -85,14 +95,14 @@ async function flushCarry(input, state) {
  *  root 在每次 Stop 已"后写赢"落定，SessionEnd 没有 last_assistant_message 可更新。 */
 async function flushMainTail(input, state) {
   const transcript = input.transcript_path ?? state.transcript_path;
-  if (!transcript) return;
+  if (!transcript) return 0;
   let lines, nextCursor;
   try {
     ({ lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0));
   } catch {
-    return; // transcript 不在了，无尾可收
+    return 0; // transcript 不在了，无尾可收
   }
-  if (!lines.length) return;
+  if (!lines.length) return 0;
   const { spans, pendingToolUses, lastEntryTs, ctxBuf } = synthesize({
     lines,
     traceId: state.trace_id,
@@ -112,6 +122,7 @@ async function flushMainTail(input, state) {
   state.pending_tool_uses = Object.fromEntries(
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),
   );
+  return spans.length;
 }
 
 /**
@@ -123,14 +134,15 @@ async function flushMainTail(input, state) {
 async function flushSubagents(input, state) {
   const transcript = input.transcript_path ?? state.transcript_path;
   const sessionId = input.session_id;
-  if (!transcript || !sessionId) return;
+  if (!transcript || !sessionId) return 0;
   const subDir = path.join(path.dirname(transcript), sessionId, "subagents");
   let files;
   try {
     files = fs.readdirSync(subDir).filter((f) => f.startsWith("agent-") && f.endsWith(".jsonl"));
   } catch {
-    return; // 没起过子代理
+    return 0; // 没起过子代理
   }
+  let flushed = 0;
   for (const f of files) {
     const agentId = f.slice("agent-".length, -".jsonl".length);
     const at = path.join(subDir, f);
@@ -210,6 +222,7 @@ async function flushSubagents(input, state) {
     }
 
     const pending = await emitBatched(spans, pendingIds(sub.pending_spans));
+    flushed += spans.length;
     writeState(
       sessionId,
       {
@@ -224,6 +237,7 @@ async function flushSubagents(input, state) {
       agentId,
     );
   }
+  return flushed;
 }
 
 run(async () => {
@@ -237,7 +251,20 @@ run(async () => {
     if (flushed) writeState(input.session_id, state);
     return;
   }
-  await flushMainTail(input, state);
-  await flushSubagents(input, state);
+  const flushedMain = await flushMainTail(input, state);
+  const flushedSub = await flushSubagents(input, state);
   writeState(input.session_id, state);
+
+  // 收尾出了新 span → 总结重算一次（吃到补齐后的完整 trace）。detached：SessionEnd 的
+  // 30s 超时罩不住 LLM 调用，且 worker 失败自己会在 summary-worker.log 留痕。
+  if (flushedMain + flushedSub > 0 && summaryEnv()) {
+    try {
+      spawn(process.execPath, [WORKER, input.session_id], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    } catch {
+      /* best-effort：起不来就这次没总结，不影响收尾 */
+    }
+  }
 });

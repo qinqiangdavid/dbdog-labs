@@ -1568,3 +1568,130 @@ describe("SessionEnd 收尾：会话直接结束不丢尾", () => {
     expect(ofTrace[0].tokens_output).toBe(900); // 且只是它——停用后的闲聊没被算进来
   });
 });
+
+// —— 总结失败要留痕 + SessionEnd 触发总结（2026-08-14）——
+// 45/47 圈无总结的教训：worker detached + stdio ignore + run() 吞错 = 死了没人知道。
+// ① 失败在 obsDir/summary-worker.log 落一行（时间戳 + session + 错误）；
+// ② 一次性会话的总结改由 SessionEnd 收尾后触发——此时尾部结论 span 已补齐，
+//    总结吃到的是完整 trace（Stop 时刻的 spawn 保持不动，读侧同键后写赢）。
+describe("总结失败留痕 + SessionEnd 触发总结", () => {
+  function startStub(payload, status = 200) {
+    const server = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      });
+    });
+    return new Promise((r) =>
+      server.listen(0, "127.0.0.1", () =>
+        r({ baseUrl: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((c) => server.close(c)) }),
+      ),
+    );
+  }
+  function runWorker(dir, sessionId, extraEnv) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HOOK_DIR, "summary-worker.mjs"), sessionId], {
+        env: {
+          ...process.env,
+          DBDOG_OBS_DIR: dir,
+          DBDOG_OBS_SPANS: path.join(dir, "spans.jsonl"),
+          DBDOG_OBS_REPORT_URL: "",
+          DBDOG_OBS_API_KEY: "",
+          ...extraEnv,
+        },
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve(code));
+    });
+  }
+  const waitFor = async (pred, ms = 4000) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (pred()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return pred();
+  };
+
+  it("worker 失败 → summary-worker.log 留一行可诊断痕迹（exit 仍 0）", async () => {
+    const dir = tempObsDir();
+    // 推理模型典型故障:200 + thinking-only + stop_reason=max_tokens
+    const llm = await startStub({ stop_reason: "max_tokens", content: [{ type: "thinking", thinking: "…" }] });
+    const traceId = "d".repeat(32);
+    fs.writeFileSync(
+      path.join(dir, "wl.json"),
+      JSON.stringify({ active: true, trace_id: traceId, root_span_id: traceId.slice(0, 16), session_id: "wl", started_at: "2026-07-15T00:00:00.000Z" }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "spans.jsonl"),
+      JSON.stringify({ trace_id: traceId, span_id: traceId.slice(0, 16), kind: "agent", ts: "2026-07-15T00:00:01.000Z", output: "结论" }) + "\n",
+    );
+    try {
+      const code = await runWorker(dir, "wl", {
+        DBDOG_SUMMARY_LLM_BASE_URL: llm.baseUrl,
+        DBDOG_SUMMARY_LLM_API_KEY: "stub-key",
+      });
+      expect(code).toBe(0);
+    } finally {
+      await llm.close();
+    }
+    const logPath = path.join(dir, "summary-worker.log");
+    expect(fs.existsSync(logPath)).toBe(true);
+    const line = fs.readFileSync(logPath, "utf8");
+    expect(line).toContain("wl"); // sessionId
+    expect(line).toMatch(/max_tokens/); // 错误里说清了截停原因
+  });
+
+  it("SessionEnd 收尾后触发总结:一次性会话也能出 workflow span(吃到补齐后的完整 trace)", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "SessionEnd 之后的总结。" }], usage: {} });
+    const tr = writeTranscript(dir, "se-sum.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么慢" } },
+    ]);
+    const summaryEnvVars = {
+      DBDOG_SUMMARY_LLM_BASE_URL: llm.baseUrl,
+      DBDOG_SUMMARY_LLM_API_KEY: "stub-key",
+    };
+    runHook("user-prompt-submit.mjs", { session_id: "se-sum", prompt: "诊断: 为什么慢", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "se-sum");
+    // Stop 时总结 env 故意不配——隔离出「SessionEnd 也要触发」这条路径
+    runHook("stop.mjs", { session_id: "se-sum", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "……" }, dir);
+    // 结论行 + 工具轮在 Stop 之后才落盘(一次性会话典型时序)
+    fs.appendFileSync(
+      tr,
+      [
+        {
+          type: "assistant", uuid: "u-tail-tool", timestamp: T("20.000"),
+          message: { model: "m", usage: { input_tokens: 5, output_tokens: 6 }, content: [
+            { type: "text", text: "查一下" },
+            { type: "tool_use", id: "tu_tail", name: "Bash", input: { command: "ls" } },
+          ] },
+        },
+        { type: "user", uuid: "u-tail-res", timestamp: T("21.000"), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_tail", content: "ok" }] } },
+        {
+          type: "assistant", uuid: "u-tail-fin", timestamp: T("22.000"),
+          message: { model: "m", usage: { input_tokens: 7, output_tokens: 8 }, content: [{ type: "text", text: "根因在 X。" }] },
+        },
+      ].map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    try {
+      runHook(
+        "session-end.mjs",
+        { session_id: "se-sum", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" },
+        dir,
+        summaryEnvVars,
+      );
+      const ok = await waitFor(() =>
+        fs.existsSync(path.join(dir, "spans.jsonl")) &&
+        readSpans(dir).some((s) => s.kind === "workflow" && s.name === "diagnosis-summary" && s.trace_id === st.trace_id),
+      );
+      expect(ok, "SessionEnd 后 4s 内应出 workflow 总结 span").toBe(true);
+    } finally {
+      await llm.close();
+    }
+    const sum = readSpans(dir).find((s) => s.kind === "workflow");
+    expect(sum.output).toBe("SessionEnd 之后的总结。");
+    expect(sum.ts).toBe(st.started_at ?? sum.ts); // ts 锚在 trace 起点(既有约定)
+  });
+});

@@ -177,3 +177,92 @@ describe("generateSummary", () => {
     }
   });
 });
+
+// —— 推理模型兼容（2026-08-14，47 圈巡检 45 圈无总结的根因）——
+// deepseek-v4 系经 Anthropic 兼容端点是推理模型：thinking 块先行，max_tokens: 1024
+// 全被 thinking 烧光，text 一个字没出就 stop_reason=max_tokens——generateSummary
+// 报「空 content」，worker 静默死。两个成功圈只是模型碰巧想得短。
+// 且成功回答实测 1194 output tokens > 1024：即便直答旧预算也会拦腰截断。
+describe("generateSummary · 推理模型兼容", () => {
+  const stubOk = (captures) => async (url, init) => {
+    captures.push(JSON.parse(init.body));
+    return new Response(
+      JSON.stringify({ content: [{ type: "text", text: "总结正文。" }], usage: { input_tokens: 1, output_tokens: 2 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  it("请求关掉 thinking 且 max_tokens 默认 2048", async () => {
+    Object.assign(process.env, baseEnv);
+    const env = summaryEnv();
+    const calls = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = stubOk(calls);
+    try {
+      await generateSummary(buildPrompt("x"), env);
+    } finally {
+      globalThis.fetch = orig;
+    }
+    expect(calls).toHaveLength(1);
+    expect(calls[0].thinking).toEqual({ type: "disabled" });
+    expect(calls[0].max_tokens).toBe(2048);
+  });
+
+  it("DBDOG_SUMMARY_LLM_MAX_TOKENS 覆盖预算", async () => {
+    Object.assign(process.env, baseEnv);
+    process.env.DBDOG_SUMMARY_LLM_MAX_TOKENS = "4096";
+    const env = summaryEnv();
+    expect(env.maxTokens).toBe(4096);
+    const calls = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = stubOk(calls);
+    try {
+      await generateSummary(buildPrompt("x"), env);
+    } finally {
+      globalThis.fetch = orig;
+      delete process.env.DBDOG_SUMMARY_LLM_MAX_TOKENS;
+    }
+    expect(calls[0].max_tokens).toBe(4096);
+  });
+
+  it("thinking-only + max_tokens 截停 → 报错说清 stop_reason 与块型（可诊断，不再是裸『空 content』）", async () => {
+    Object.assign(process.env, baseEnv);
+    const env = summaryEnv();
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({ stop_reason: "max_tokens", content: [{ type: "thinking", thinking: "……" }], usage: {} }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    try {
+      await expect(generateSummary(buildPrompt("x"), env)).rejects.toThrow(/max_tokens.*thinking|thinking.*max_tokens/s);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("旧兼容端点 400 拒 thinking 字段 → 去掉该字段重试一次", async () => {
+    Object.assign(process.env, baseEnv);
+    const env = summaryEnv();
+    const calls = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      calls.push(body);
+      if (body.thinking) return new Response(JSON.stringify({ error: "unknown field: thinking" }), { status: 400 });
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "兼容端点正文。" }], usage: {} }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    try {
+      const out = await generateSummary(buildPrompt("x"), env);
+      expect(out.text).toBe("兼容端点正文。");
+    } finally {
+      globalThis.fetch = orig;
+    }
+    expect(calls).toHaveLength(2);
+    expect(calls[0].thinking).toEqual({ type: "disabled" });
+    expect(calls[1].thinking).toBeUndefined();
+  });
+});

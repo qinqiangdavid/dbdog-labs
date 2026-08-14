@@ -6,16 +6,42 @@
 // 重复生成落同一行：span_id 派生固定 + ts 锚 state.started_at（两者都进 ClickHouse 排序键，
 // 只固定 span_id 折不掉）→ 后写赢。
 // best-effort：env 未配 / 任何失败 → 直接返回，不打扰任何人（run() 兜底吞错、exit 0）。
+// 失败留痕（2026-08-14）：本进程 detached + stdio ignore，run() 只写 stderr 等于写进黑洞
+// ——45/47 圈巡检没总结、死因（推理模型 thinking 烧光 max_tokens）藏了两天没人知道。
+// 现在任何失败在 obsDir/summary-worker.log 追加一行（时间戳 + session + 错误），可诊断、
+// 不打扰会话；日志只追加小行，不设轮转（量级 = 每次失败一行）。
 // 用法：node summary-worker.mjs <sessionId>
-import { readState, spanIndex, appendSpans, reportSpans, deriveSpanId, run } from "./lib.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { obsDir, readState, spanIndex, appendSpans, reportSpans, deriveSpanId, run } from "./lib.mjs";
 import { trimSpans, buildPrompt, generateSummary, summaryEnv } from "./summary.mjs";
 
 const SUMMARY_KIND = "workflow";
 const SUMMARY_NAME = "diagnosis-summary";
 
+/** 失败落一行；日志本身失败就算了（绝不因留痕再抛）。 */
+function logFailure(sessionId, err) {
+  try {
+    fs.appendFileSync(
+      path.join(obsDir(), "summary-worker.log"),
+      `${new Date().toISOString()} session=${sessionId} ${err?.message ?? err}\n`,
+    );
+  } catch {
+    /* 留不下就留不下 */
+  }
+}
+
 run(async () => {
   const sessionId = process.argv[2];
   if (!sessionId) return;
+  try {
+    await main(sessionId);
+  } catch (err) {
+    logFailure(sessionId, err);
+  }
+});
+
+async function main(sessionId) {
   const state = readState(sessionId);
   if (!state?.trace_id || !state?.root_span_id) return;
 
@@ -64,4 +90,4 @@ run(async () => {
 
   appendSpans([summarySpan]); // 本地真相源先落
   await reportSpans([summarySpan]); // best-effort：推失败也有本地记录
-});
+}
