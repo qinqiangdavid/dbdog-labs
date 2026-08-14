@@ -1428,3 +1428,143 @@ describe("上报超时可配", () => {
     }
   });
 });
+
+// —— 会话直接结束（claude -p / 关窗）的尾巴（2026-08-14）——
+// carry 机制只在「下一次 UserPromptSubmit」铸造时记账；一次性会话没有下一次，
+// Stop 读 transcript 时结论行还没落盘 → [cursor, EOF] 永久没人合成。
+// 47 圈 headless 巡检实测：46/47 圈丢尾部 llm span（正是结论轮）；更狠的是
+// 会话退出时仍在跑的子代理连 SubagentStop 都没有，整棵子树消失（一圈丢 241 条）。
+// 根治：SessionEnd hook 收尾——主线补 [cursor, EOF]，子代理 transcript 挨个补到 EOF。
+describe("SessionEnd 收尾：会话直接结束不丢尾", () => {
+  const lateFinal = {
+    type: "assistant",
+    uuid: "u-final",
+    timestamp: T("30.000"),
+    message: {
+      model: "claude-fable-5",
+      usage: { input_tokens: 100, output_tokens: 900 },
+      content: [{ type: "text", text: "## 诊断报告\n根因是 vacuum_cost_delay。" }],
+    },
+  };
+
+  it("Stop 之后才落盘的结论行，SessionEnd 按本 trace 补出 llm span", () => {
+    const dir = tempObsDir();
+    const tr = writeTranscript(dir, "se1.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 第一问" } },
+    ]);
+    runHook("user-prompt-submit.mjs", { session_id: "se1", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "se1");
+    runHook("stop.mjs", { session_id: "se1", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+    // ← 结论行此刻才落盘；一次性会话再没有下一轮 UserPromptSubmit/Stop
+    fs.appendFileSync(tr, JSON.stringify(lateFinal) + "\n");
+
+    runHook("session-end.mjs", { session_id: "se1", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const llm = readSpans(dir).filter((s) => s.kind === "llm" && s.trace_id === st.trace_id);
+    expect(llm).toHaveLength(1);
+    expect(llm[0].parent_id).toBe(st.root_span_id);
+    expect(llm[0].tokens_output).toBe(900);
+    expect(readState(dir, "se1").cursor).toBe(fs.statSync(tr).size); // 游标推到 EOF
+  });
+
+  it("会话退出时仍在跑的子代理：SessionEnd 把整棵子树补出来", () => {
+    const dir = tempObsDir();
+    const tr = writeTranscript(dir, "se2.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 并发问题" } },
+    ]);
+    runHook("user-prompt-submit.mjs", { session_id: "se2", prompt: "诊断: 并发问题", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const st = readState(dir, "se2");
+    runHook("stop.mjs", { session_id: "se2", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "派了个子代理" }, dir);
+
+    // 子代理 transcript 存在、但从没有 SubagentStop（会话退出时它还在跑）
+    const subDir = path.join(dir, "se2", "subagents");
+    fs.mkdirSync(subDir, { recursive: true });
+    const agentId = "adeadbeef12345678";
+    fs.writeFileSync(
+      path.join(subDir, `agent-${agentId}.meta.json`),
+      JSON.stringify({ agentType: "general-purpose", toolUseId: "tu_x", spawnDepth: 1 }),
+    );
+    fs.writeFileSync(
+      path.join(subDir, `agent-${agentId}.jsonl`),
+      [
+        { type: "user", uuid: "s-u", timestamp: T("10.000"), message: { role: "user", content: "查锁等待" } },
+        {
+          type: "assistant",
+          uuid: "s-a1",
+          timestamp: T("12.000"),
+          message: {
+            model: "claude-fable-5",
+            usage: { input_tokens: 10, output_tokens: 20 },
+            content: [
+              { type: "text", text: "先查 pg_locks" },
+              { type: "tool_use", id: "s_tu1", name: "Bash", input: { command: "gsql -c 'select 1'" } },
+            ],
+          },
+        },
+        {
+          type: "user",
+          uuid: "s-u2",
+          timestamp: T("13.000"),
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: "s_tu1", content: "1" }] },
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join("\n") + "\n",
+    );
+
+    runHook("session-end.mjs", { session_id: "se2", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const spans = readSpans(dir).filter((s) => s.trace_id === st.trace_id);
+    const agentSpan = spans.find((s) => s.kind === "agent" && s.name === "claude-code.subagent");
+    expect(agentSpan).toBeTruthy();
+    expect(agentSpan.tags.agent_id).toBe(agentId);
+    expect(agentSpan.tags.agent_type).toBe("general-purpose");
+    const subLlm = spans.filter((s) => s.kind === "llm" && s.tags.agent_id === agentId);
+    const subTool = spans.filter((s) => s.kind === "tool" && s.tags.agent_id === agentId);
+    expect(subLlm).toHaveLength(1);
+    expect(subTool).toHaveLength(1);
+    expect(subLlm[0].parent_id).toBe(agentSpan.span_id); // 挂在子代理自己的 agent span 下
+  });
+
+  it("SessionEnd 重入幂等：第二次跑不再产新 span", () => {
+    const dir = tempObsDir();
+    const tr = writeTranscript(dir, "se3.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 第一问" } },
+    ]);
+    runHook("user-prompt-submit.mjs", { session_id: "se3", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    runHook("stop.mjs", { session_id: "se3", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+    fs.appendFileSync(tr, JSON.stringify(lateFinal) + "\n");
+    runHook("session-end.mjs", { session_id: "se3", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+    const n = readSpans(dir).length;
+    runHook("session-end.mjs", { session_id: "se3", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+    expect(readSpans(dir)).toHaveLength(n);
+  });
+
+  it("trace 已停用（换过话题）只收 carry，不把停用后的行算进旧 trace", () => {
+    const dir = tempObsDir();
+    const tr = writeTranscript(dir, "se4.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 第一问" } },
+    ]);
+    runHook("user-prompt-submit.mjs", { session_id: "se4", prompt: "诊断: 第一问", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    const first = readState(dir, "se4");
+    runHook("stop.mjs", { session_id: "se4", transcript_path: tr, hook_event_name: "Stop", last_assistant_message: "报告" }, dir);
+    fs.appendFileSync(tr, JSON.stringify(lateFinal) + "\n"); // 旧 trace 的尾巴
+    runHook("user-prompt-submit.mjs", { session_id: "se4", prompt: "顺便聊聊天气", cwd: "/tmp/proj", transcript_path: tr }, dir);
+    // 停用后的闲聊行:不属于任何 trace
+    fs.appendFileSync(
+      tr,
+      JSON.stringify({
+        type: "assistant",
+        uuid: "u-chat",
+        timestamp: T("40.000"),
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 2 }, content: [{ type: "text", text: "晴" }] },
+      }) + "\n",
+    );
+
+    runHook("session-end.mjs", { session_id: "se4", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }, dir);
+
+    const ofTrace = readSpans(dir).filter((s) => s.trace_id === first.trace_id && s.kind === "llm");
+    expect(ofTrace).toHaveLength(1); // carry 区间里的结论行补上了
+    expect(ofTrace[0].tokens_output).toBe(900); // 且只是它——停用后的闲聊没被算进来
+  });
+});
