@@ -175,7 +175,11 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
                 anchor: partialLlm.anchor,
                 entries: [entry],
                 startTs: partialLlm.start_ts ?? null,
-                ctxSnapshot: ctx,
+                // 续写沿用**首批的**快照:本批 ctx 已滚入了同次调用的前半段输出,
+                // 再取当前 ctx 会把自己的 part1 混进 input_local,违反"调用前上下文"
+                // 语义(codex 二轮复审中危,纯函数反例属实)。
+                ctxSnapshot: null,
+                inputLocalOverride: partialLlm.input_local ?? null,
                 tsOverride: partialLlm.ts ?? null,
                 carriedOutput: partialLlm.output ?? "",
               }
@@ -296,7 +300,9 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       input: null, // 上报侧恒 null：远端只看 token；完整 prompt 走 input_local 纯本地
       // input_local：该轮模型调用实际看到的上下文（截尾，contentCap 控制长度）。
       // 开关 DBDOG_OBS_STORE_LLM_INPUT=0 可关；只在 spans.jsonl，reportSpans 前剥离。
-      ...(storeLlmInput() ? { input_local: capTail(g.ctxSnapshot ?? "") } : {}),
+      ...(storeLlmInput()
+        ? { input_local: g.inputLocalOverride !== undefined ? (g.inputLocalOverride ?? "") : capTail(g.ctxSnapshot ?? "") }
+        : {}),
       output: cap(emittedOutput),
       tokens_input: msg.usage.input_tokens ?? null,
       tokens_output: msg.usage.output_tokens ?? null,
@@ -325,6 +331,12 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       ts: tail.emittedTs,
       start_ts: tail.startTs ?? null,
       output: cap(tail.emittedOutput ?? ""),
+      // 首批快照随延续信息传递(已 capTail ≤ contentCap,状态可控):续批的 input_local
+      // 必须仍是"本次调用之前"的上下文,不能取续批时已含 part1 的 ctx
+      input_local:
+        tail.inputLocalOverride !== undefined
+          ? (tail.inputLocalOverride ?? "")
+          : capTail(tail.ctxSnapshot ?? ""),
     };
   }
 

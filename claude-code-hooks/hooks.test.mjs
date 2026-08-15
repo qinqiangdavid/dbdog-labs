@@ -1836,6 +1836,37 @@ describe("sweep 排空短板:批量 50 + 超时 10s + SessionEnd 触发", () => 
     }
   }, 15_000);
 
+  it("无 trace 状态的会话,SessionEnd 也触发排空(sweep 与本会话有无 trace 无关)", async () => {
+    const dir = tempObsDir();
+    const sink = await startSpanSink();
+    try {
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        JSON.stringify({ trace_id: "told2", span_id: "stuck2", kind: "llm", name: "x" }) + "\n",
+      );
+      const pOld = writeStateFile(dir, "old2.json", { trace_id: "told2", pending_spans: ["stuck2"] });
+      ageFile(pOld, 3 * HOUR);
+      // 当前会话从未触发观测:没有状态文件
+      runHook(
+        "session-end.mjs",
+        { session_id: "no-state", transcript_path: path.join(dir, "none.jsonl"), hook_event_name: "SessionEnd", reason: "exit" },
+        dir,
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k", DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR) },
+      );
+      const t0 = Date.now();
+      let drained = false;
+      while (Date.now() - t0 < 8000 && !drained) {
+        try {
+          drained = JSON.parse(fs.readFileSync(pOld, "utf8")).pending_spans?.length === 0;
+        } catch {}
+        if (!drained) await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(drained, "无状态会话的 SessionEnd 也要排空旧积压").toBe(true);
+    } finally {
+      await sink.close();
+    }
+  }, 15_000);
+
   it("显式配置的上报超时不被 sweep 的 10s 缺省覆盖", async () => {
     const dir = tempObsDir();
     // 首字节压 2s 的 sink;显式配 500ms 超时 → 必须失败、pending 保留
@@ -1929,6 +1960,13 @@ describe("codex 复审阻断项", () => {
     expect(last.tokens_output).toBe(20); // usage 是全量重复,不是增量——只算一次
     expect(last.output).toContain("part1");
     expect(last.output).toContain("part2");
+    // 复审中危:续写行的 input_local 必须仍是"本次调用之前"的快照——part1 是本次调用
+    // 自己的输出,混进去就违反语义(续写沿用首批快照)
+    expect(last.input_local ?? "").not.toContain("part1");
+    // 复审高危:root 刷新要吃到整段结论(同 requestId 多行合并后的全量,不是只取末行)
+    const root = readSpans(dir).filter((s) => s.span_id === st.root_span_id).pop();
+    expect(root.output).toContain("part1");
+    expect(root.output).toContain("part2");
   });
 
   it("旧话题的子代理(无状态文件、trace 开始前已停笔)不挂进当前 trace", () => {
@@ -2096,7 +2134,7 @@ describe("summary 代次校验与上报失败留痕", () => {
     expect(sums, "旧快照(水位 1)不得覆盖更完整的总结(水位 999)").toHaveLength(0);
   });
 
-  it("上报失败:span_id 进主状态 pending_spans + summary-worker.log 留痕", async () => {
+  it("上报失败:span_id 落 worker 自己的 sidecar 状态(保持主状态单写者)+ 日志留痕", async () => {
     const dir = tempObsDir();
     const llm = await startStub({ content: [{ type: "text", text: "正文" }], usage: {} });
     const sink = await startStub({}, 500); // 上报端点恒 500
@@ -2114,10 +2152,34 @@ describe("summary 代次校验与上报失败留痕", () => {
     }
     const sums = readSpans(dir).filter((s) => s.kind === "workflow");
     expect(sums).toHaveLength(1); // 本地真相源照落
-    const st = JSON.parse(fs.readFileSync(path.join(dir, "rf.json"), "utf8"));
-    expect(st.pending_spans).toContain(sums[0].span_id); // sweep 之后能救
+    // 复审阻断:worker 不得写主状态(会与持旧快照的 Stop/SessionEnd 互相覆盖)——
+    // pending 落 worker 专属 sidecar <session>.summary.json,sweep 同样扫得到、能补发
+    const main = JSON.parse(fs.readFileSync(path.join(dir, "rf.json"), "utf8"));
+    expect(main.pending_spans ?? []).toEqual([]); // 主状态不被 worker 碰
+    const side = JSON.parse(fs.readFileSync(path.join(dir, "rf.summary.json"), "utf8"));
+    expect(side.pending_spans).toContain(sums[0].span_id); // sweep 之后能救
     const log = fs.readFileSync(path.join(dir, "summary-worker.log"), "utf8");
     expect(log).toContain("rf");
     expect(log).toMatch(/report|上报/);
+  });
+
+  it("水位=trace 的原始行数(同键重发也涨水位),SessionEnd 的完整快照恒压过 Stop 的残缺快照", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "总结" }], usage: {} });
+    seed(dir, "wm");
+    // root 被刷新过一次 → 同 span_id 两行 + llm 一行 = 3 行;unique 只有 2。
+    // 若水位按 unique 数,Stop 残缺快照与 SessionEnd 完整快照水位相等,旧 worker 仍可后写覆盖。
+    fs.appendFileSync(
+      path.join(dir, "spans.jsonl"),
+      JSON.stringify({ trace_id: TRACE, span_id: TRACE.slice(0, 16), kind: "agent", ts: "2026-07-15T00:00:01.000Z", output: "结论(刷新)" }) + "\n" +
+      JSON.stringify({ trace_id: TRACE, span_id: "llm0000000000001", kind: "llm", ts: "2026-07-15T00:00:02.000Z", output: "推理" }) + "\n",
+    );
+    try {
+      await runWorker(dir, "wm", { DBDOG_SUMMARY_LLM_BASE_URL: llm.url, DBDOG_SUMMARY_LLM_API_KEY: "k" });
+    } finally {
+      await llm.close();
+    }
+    const gen = JSON.parse(fs.readFileSync(path.join(dir, `${TRACE}.summary-gen.json`), "utf8"));
+    expect(gen.watermark, "水位必须按原始行数(3),不是去重后的 span 数(2)").toBe(3);
   });
 });

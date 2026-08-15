@@ -180,7 +180,11 @@ async function flushMainTail(input, state) {
     }));
   }
 
-  const lastText = lastAssistantText(lines);
+  // 尾部结论:优先取本批最后一条 llm span 的 output——它经 partial_llm 续写合并,
+  // 同 requestId 多行的结论是**全量**;只取最后一行 JSONL 会把前半段丢掉
+  // (codex 二轮复审高危)。没有 llm span(无 usage 行)再退回逐行扫描。
+  const lastLlm = spans.filter((s) => s.kind === "llm").pop();
+  const lastText = (lastLlm && lastLlm.output) || lastAssistantText(lines);
   if (!state.root_emitted || lastText) {
     spans.push({
       trace_id: state.trace_id,
@@ -340,11 +344,8 @@ async function flushSubagents(input, state) {
   return flushed;
 }
 
-run(async () => {
-  const input = await readStdinJson();
-  const state = readState(input.session_id);
-  if (!state?.trace_id) return; // 无 trace 归属 → 无尾可收
-
+/** trace 相关收尾（有 trace 状态才有事做;sweep 排空独立于此,见 run()）。 */
+async function handleTraceTail(input, state) {
   const flushed = await flushCarry(input, state);
   if (state.active === false) {
     // 停用后的行不属于任何 trace；子代理丢弃是既有语义（见 user-prompt-submit.mjs）
@@ -357,14 +358,23 @@ run(async () => {
 
   // 收尾出了新 span → 总结重算一次（吃到补齐后的完整 trace）。detached：SessionEnd 的
   // 30s 超时罩不住 LLM 调用，且 worker 失败自己会在 summary-worker.log 留痕。
-  // 新旧 worker 竞态由 worker 侧的代次校验兜底（summary-worker.mjs，旧快照丢弃自己的结果）。
+  // 新旧 worker 竞态由 worker 侧的代次校验兜底（summary-worker.mjs，水位=原始行数）。
   if (flushedMain + flushedSub > 0 && summaryEnv()) {
     spawnDetached([WORKER, input.session_id], input.session_id, "summary worker");
   }
+}
 
-  // 收尾流程末尾顺手排空积压（2026-08-14，owner 拍板）：一串 headless 会话跑完之后
-  // 再无 SessionStart，旧会话卡死的 pending 从此没人补发——47 圈巡检 B 类送达丢失
-  // （168 条横跨 30+ 小时）正是这条触发链断掉。sweep 只碰 idle>2h 的旧状态文件，
-  // 与本会话刚写的文件天然无竞争（本会话自己的 pending 留给之后的 sweep）。
-  spawnDetached([SWEEP], input.session_id, "sweep");
+run(async () => {
+  const input = await readStdinJson();
+  const state = readState(input.session_id);
+  try {
+    if (state?.trace_id) await handleTraceTail(input, state);
+  } finally {
+    // 排空积压与"本会话有没有 trace"无关（codex 二轮复审高危:门控遗漏）——
+    // 未触发观测的会话退出同样是排空时机。一串 headless 会话跑完之后再无
+    // SessionStart，旧会话卡死的 pending 从此没人补发——47 圈巡检 B 类送达丢失
+    // （168 条横跨 30+ 小时）正是这条触发链断掉。sweep 只碰 idle>2h 的旧状态文件，
+    // 与本会话刚写的文件天然无竞争（本会话自己的 pending 留给之后的 sweep）。
+    spawnDetached([SWEEP], input.session_id ?? "-", "sweep");
+  }
 });

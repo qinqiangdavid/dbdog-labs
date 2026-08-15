@@ -13,7 +13,7 @@
 // 用法：node summary-worker.mjs <sessionId>
 import fs from "node:fs";
 import path from "node:path";
-import { obsDir, readState, spanIndex, appendSpans, reportSpans, deriveSpanId, pendingIds, run, writeState } from "./lib.mjs";
+import { obsDir, readState, spansPath, appendSpans, reportSpans, deriveSpanId, pendingIds, run, writeState } from "./lib.mjs";
 import { trimSpans, buildPrompt, generateSummary, summaryEnv } from "./summary.mjs";
 
 const SUMMARY_KIND = "workflow";
@@ -48,15 +48,39 @@ async function main(sessionId) {
   const env = summaryEnv();
   if (!env) return; // 未配 → 不出总结（不影响 trace）
 
-  // 本 trace 的 span（真相源 = spans.jsonl）
-  const spans = [...spanIndex().values()].filter((s) => s.trace_id === state.trace_id);
+  // 本 trace 的 span（真相源 = spans.jsonl）。一次读同时算两件事：
+  // · 去重视图（span_id 后写赢）喂事实表；
+  // · 原始行数 = 快照水位。水位必须按**行数**而非去重后 span 数（codex 二轮复审阻断项）：
+  //   SessionEnd 的 root 刷新/跨批续写都是同键追加行，去重数不变——完整快照与残缺快照
+  //   水位相等的话，旧 worker 仍能后写覆盖。行数只增不减，完整快照恒压过残缺快照。
+  let watermark = 0;
+  const byId = new Map();
+  let text;
+  try {
+    text = fs.readFileSync(spansPath(), "utf8");
+  } catch {
+    return; // 没有本地 JSONL 就没有素材
+  }
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let span;
+    try {
+      span = JSON.parse(line);
+    } catch {
+      continue; // 容忍脏行
+    }
+    if (span?.trace_id !== state.trace_id || !span.span_id) continue;
+    watermark++;
+    byId.set(span.span_id, span);
+  }
+  const spans = [...byId.values()];
   if (spans.length === 0) return;
 
-  // 快照水位（codex 复审:代次校验）：Stop 与 SessionEnd 各 spawn 一个 worker 时，
-  // 旧快照（span 少）的那个可能因 LLM 慢而后写，把完整总结覆盖回残缺版。固定键只保
-  // 「可折叠」，不保「新的赢」——写之前按水位（本快照的 span 数）比较，矮水位丢弃自己。
-  // 标记文件取 .summary-gen.json 后缀：sweep 会把它当已排空的子代理状态走 1 天 TTL 清理。
-  const watermark = spans.length;
+  // 代次校验（codex 复审）：Stop 与 SessionEnd 各 spawn 一个 worker 时，旧快照的那个
+  // 可能因 LLM 慢而后写，把完整总结覆盖回残缺版。固定键只保「可折叠」，不保「新的赢」
+  // ——写之前按水位比较，矮水位丢弃自己；等水位 = 同一份快照，谁写都等价。
+  // 读—比—写仍有毫秒级窗口（相对 LLM 调用的几十秒已收敛三个量级），彻底原子要文件锁，
+  // 按「最小修」不做。标记文件取 .summary-gen.json 后缀：sweep 当子代理状态走 1 天 TTL 清理。
   const genPath = path.join(obsDir(), `${state.trace_id}.summary-gen.json`);
 
   // 裁剪 → 提示词 → 本地大模型（失败抛 → run() 吞）
@@ -114,14 +138,18 @@ async function main(sessionId) {
   appendSpans([summarySpan]); // 本地真相源先落
   if (!(await reportSpans([summarySpan]))) {
     // 送达失败（codex 复审）：一次性会话之后没有下一轮重试,不落 pending 平台就永久没有。
-    // span_id 记进主状态 pending_spans,交给之后任何一次 sweep 补发;同时留痕。
+    // pending 落 worker **专属 sidecar** <session>.summary.json（statePath 的 "summary"
+    // 假 agent 位）——绝不写主状态：持旧快照、正在等上报的 Stop/SessionEnd 随后整文件
+    // 覆盖会把它抹掉（codex 二轮复审阻断项:主状态必须保持单写者）。sweep 扫所有状态
+    // 文件,sidecar 同样被补发、排空后按子代理 TTL(1 天)自然清理。
     try {
-      const cur = readState(sessionId) ?? state;
-      cur.pending_spans = [...pendingIds(cur.pending_spans), summarySpan.span_id];
-      writeState(sessionId, cur);
+      const side = readState(sessionId, "summary") ?? {};
+      side.trace_id = state.trace_id;
+      side.pending_spans = [...pendingIds(side.pending_spans), summarySpan.span_id];
+      writeState(sessionId, side, "summary");
     } catch {
       /* 状态写不动,至少还有日志与本地 JSONL */
     }
-    logFailure(sessionId, "summary span report failed（已落本地与 pending，待 sweep 补发）");
+    logFailure(sessionId, "summary span report failed（已落本地与 sidecar pending，待 sweep 补发）");
   }
 }
