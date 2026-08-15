@@ -31,6 +31,27 @@ function logFailure(sessionId, err) {
   }
 }
 
+/** wx 抢锁:3 次×50ms;陈锁(>10 分钟,worker 崩溃残留)接管。抢不到 = 有人在提交。 */
+function acquireLock(lockPath) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: "wx" });
+      return true;
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > 10 * 60_000) {
+          fs.unlinkSync(lockPath);
+          continue; // 陈锁已清,立刻重试
+        }
+      } catch {
+        continue; // 对方刚释放,立刻重试
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); // 活锁短等
+    }
+  }
+  return false;
+}
+
 run(async () => {
   const sessionId = process.argv[2];
   if (!sessionId) return;
@@ -79,29 +100,16 @@ async function main(sessionId) {
   // 代次校验（codex 复审）：Stop 与 SessionEnd 各 spawn 一个 worker 时，旧快照的那个
   // 可能因 LLM 慢而后写，把完整总结覆盖回残缺版。固定键只保「可折叠」，不保「新的赢」
   // ——写之前按水位比较，矮水位丢弃自己；等水位 = 同一份快照，谁写都等价。
-  // 读—比—写仍有毫秒级窗口（相对 LLM 调用的几十秒已收敛三个量级），彻底原子要文件锁，
-  // 按「最小修」不做。标记文件取 .summary-gen.json 后缀：sweep 当子代理状态走 1 天 TTL 清理。
+  // 提交段（检查→写水位→落盘）由 wx 文件锁互斥（codex 三轮核对：读—比—写—追加要原子）：
+  // 锁只罩纯本地操作（毫秒级持锁，LLM 调用与上报都在锁外），竞不到锁 = 有并发 worker
+  // 正在提交，丢弃自己的结果并留痕；陈锁（worker 崩溃残留，>10 分钟）可接管。
+  // 两个标记文件都取 *.json 后缀：sweep 当子代理状态走 TTL 自然清理。
   const genPath = path.join(obsDir(), `${state.trace_id}.summary-gen.json`);
+  const lockPath = path.join(obsDir(), `${state.trace_id}.summary-lock.json`);
 
   // 裁剪 → 提示词 → 本地大模型（失败抛 → run() 吞）
   const factTable = trimSpans(spans);
   const result = await generateSummary(buildPrompt(factTable), env);
-
-  let existing = null;
-  try {
-    existing = JSON.parse(fs.readFileSync(genPath, "utf8"));
-  } catch {
-    /* 没有标记 = 首个写者 */
-  }
-  if (existing && Number(existing.watermark) > watermark) {
-    logFailure(sessionId, `stale snapshot dropped: watermark ${watermark} < ${existing.watermark}`);
-    return;
-  }
-  try {
-    fs.writeFileSync(genPath, JSON.stringify({ watermark }));
-  } catch {
-    /* 标记写不动就退回后写赢,不阻塞总结 */
-  }
 
   // 组装总结 span（固定 span_id → 后写赢，重复生成覆盖同一行）
   const summarySpan = {
@@ -135,7 +143,40 @@ async function main(sessionId) {
     },
   };
 
-  appendSpans([summarySpan]); // 本地真相源先落
+  if (!acquireLock(lockPath)) {
+    logFailure(sessionId, `summary commit lock busy（水位 ${watermark}），丢弃本次结果`);
+    return;
+  }
+  let committed = false;
+  try {
+    let existing = null;
+    try {
+      existing = JSON.parse(fs.readFileSync(genPath, "utf8"));
+    } catch {
+      /* 没有标记 = 首个写者 */
+    }
+    if (existing && Number(existing.watermark) > watermark) {
+      logFailure(sessionId, `stale snapshot dropped: watermark ${watermark} < ${existing.watermark}`);
+      return;
+    }
+    try {
+      fs.writeFileSync(genPath, JSON.stringify({ watermark }));
+    } catch {
+      /* 标记写不动就退回后写赢,不阻塞总结 */
+    }
+
+
+    appendSpans([summarySpan]); // 本地真相源先落（在锁内:与代次标记同段原子）
+    committed = true;
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      /* 锁没了就没了 */
+    }
+  }
+  if (!committed) return;
+  // 上报在锁外:3s 网络超时不该占住提交段
   if (!(await reportSpans([summarySpan]))) {
     // 送达失败（codex 复审）：一次性会话之后没有下一轮重试,不落 pending 平台就永久没有。
     // pending 落 worker **专属 sidecar** <session>.summary.json（statePath 的 "summary"
@@ -143,10 +184,13 @@ async function main(sessionId) {
     // 覆盖会把它抹掉（codex 二轮复审阻断项:主状态必须保持单写者）。sweep 扫所有状态
     // 文件,sidecar 同样被补发、排空后按子代理 TTL(1 天)自然清理。
     try {
-      const side = readState(sessionId, "summary") ?? {};
+      // 按 trace 隔离(codex 三轮核对:同 session 多 trace 的 worker 共写一个 sidecar
+      // 仍是读改写竞态)。同 trace 只有锁的赢家能走到这里 → 每文件单写者成立。
+      const sideKey = `summary-${state.trace_id.slice(0, 16)}`;
+      const side = readState(sessionId, sideKey) ?? {};
       side.trace_id = state.trace_id;
       side.pending_spans = [...pendingIds(side.pending_spans), summarySpan.span_id];
-      writeState(sessionId, side, "summary");
+      writeState(sessionId, side, sideKey);
     } catch {
       /* 状态写不动,至少还有日志与本地 JSONL */
     }

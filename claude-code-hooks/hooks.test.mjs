@@ -196,6 +196,10 @@ function seedState(dir, sessionId, transcriptPath, extra = {}) {
   return state;
 }
 
+function readSpansSafe(dir) {
+  return fs.existsSync(path.join(dir, "spans.jsonl")) ? readSpans(dir) : [];
+}
+
 function readSpans(dir) {
   return fs
     .readFileSync(path.join(dir, "spans.jsonl"), "utf8")
@@ -2156,11 +2160,44 @@ describe("summary 代次校验与上报失败留痕", () => {
     // pending 落 worker 专属 sidecar <session>.summary.json,sweep 同样扫得到、能补发
     const main = JSON.parse(fs.readFileSync(path.join(dir, "rf.json"), "utf8"));
     expect(main.pending_spans ?? []).toEqual([]); // 主状态不被 worker 碰
-    const side = JSON.parse(fs.readFileSync(path.join(dir, "rf.summary.json"), "utf8"));
+    const side = JSON.parse(fs.readFileSync(path.join(dir, `rf.summary-${TRACE.slice(0, 16)}.json`), "utf8"));
     expect(side.pending_spans).toContain(sums[0].span_id); // sweep 之后能救
     const log = fs.readFileSync(path.join(dir, "summary-worker.log"), "utf8");
     expect(log).toContain("rf");
     expect(log).toMatch(/report|上报/);
+  });
+
+  it("提交段互斥:活锁在手的并发 worker 丢弃自己的结果并留痕", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "会输的那份" }], usage: {} });
+    seed(dir, "lk");
+    // 另一个 worker 正持锁提交(锁是新鲜的)
+    fs.writeFileSync(path.join(dir, `${TRACE}.summary-lock.json`), JSON.stringify({ pid: 1, at: Date.now() }));
+    try {
+      await runWorker(dir, "lk", { DBDOG_SUMMARY_LLM_BASE_URL: llm.url, DBDOG_SUMMARY_LLM_API_KEY: "k" });
+    } finally {
+      await llm.close();
+    }
+    expect(readSpansSafe(dir).filter((s) => s.kind === "workflow"), "锁在别人手里就不得写").toHaveLength(0);
+    const log = fs.readFileSync(path.join(dir, "summary-worker.log"), "utf8");
+    expect(log).toMatch(/lock/i);
+  });
+
+  it("陈锁可接管:崩溃残留的旧锁不阻塞后来的 worker", async () => {
+    const dir = tempObsDir();
+    const llm = await startStub({ content: [{ type: "text", text: "接管后写成" }], usage: {} });
+    seed(dir, "st");
+    const lock = path.join(dir, `${TRACE}.summary-lock.json`);
+    fs.writeFileSync(lock, JSON.stringify({ pid: 1, at: 0 }));
+    ageFile(lock, HOUR); // 一小时前的陈锁 = worker 崩溃残留
+    try {
+      await runWorker(dir, "st", { DBDOG_SUMMARY_LLM_BASE_URL: llm.url, DBDOG_SUMMARY_LLM_API_KEY: "k" });
+    } finally {
+      await llm.close();
+    }
+    const sums = readSpansSafe(dir).filter((s) => s.kind === "workflow");
+    expect(sums, "陈锁必须可接管,否则一次崩溃永久没总结").toHaveLength(1);
+    expect(sums[0].output).toBe("接管后写成");
   });
 
   it("水位=trace 的原始行数(同键重发也涨水位),SessionEnd 的完整快照恒压过 Stop 的残缺快照", async () => {
