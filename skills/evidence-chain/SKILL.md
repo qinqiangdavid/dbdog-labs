@@ -57,12 +57,26 @@ python S/run.py 题目目录 --source 源码树目录      # 目录里有 prompt
 
 How do we know 的顺序是「先想要什么证据,再想用什么取,再真取」,工具目录只约束命名,不约束该不该列。之后与正向图对比时,前三类结论(无工具 / 应有结果但没有 / 结果不对)只看 How do we know 和附录就能定,与 agent 无关;「假设提错」「工具调错」由对比的模型拿正向图对着 Why 和 How do we know 判。
 
+## 批量:一次给全量用例,顺序跑
+
+现象和根因各自是多用例的大文件时不用拆,写一份 `batch.md`(模板见 `batch.example.md`):上面几行全局设置(现象文件、根因文件、源码树、输出目录、间隔分钟,可选模型/模型档/MCP配置),下面一张表一行一个用例(用例号、事故窗、修复来源、备注)。runner 按用例号在两个大文件里找小节(优先「标题行含用例号」,没有标题就从含用例号的那行取到下一个用例号之前);根因文件里没有的用例自动跳过并写进汇总。
+
+```bash
+python S/batch.py batch.md --dry-run     # 只切好每个用例的输入(输出目录\用例号\prompt.txt / root-cause.md / window.txt)、写汇总,不起模型;先用它核切分对不对
+python S/batch.py batch.md               # 顺序跑,用例之间歇「间隔分钟」;中断后重跑会跳过已有产物的用例
+python S/batch.py batch.md --only DTS001,DTS002 --force
+```
+
+修复来源那列三种都行:本地 diff 文件;GitHub/Gitee 的 PR 或 commit 链接(自动取 `.diff`);**问题单网页地址**(如 DTS 单,修复代码贴在页面里)——runner 先试着把页面抓成 `ticket.txt` 交给推导角,抓不到(要登录)就把地址交给推导角,放开 WebFetch 让它自己打开;都找不到修复代码就按 `fix_diff: absent`。
+
+产物:`输出目录\用例号\evidence-chain.md`(+ `.json`),以及 `输出目录atch-summary.md`,一行一个用例:状态、讲不讲得通的结论、四类取证计数、dbdog 侧发现条数。
+
 ## 环境
 
 - Python 3.8+(标准库)+ Claude Code CLI(`claude` 在 PATH;Windows 的 `claude.cmd` 会自动找到)+ 可用的 dbdog MCP
 - 分析会话会把 `DBDOG_OBS_REPORT_URL` 置空,不会往观测平台再长一棵树
 - 工具目录 `references/dbdog-tool-catalog.json`(57 个 dbdog-mcp 工具 + `local_source_tree` 源码证据面);刷新用 `scripts/fetch-catalog.py`
-- 自检:`python S/run.test.py`
+- 自检:`python S/run.test.py` 与 `python S/batch.test.py`
 
 ## 文件
 
@@ -70,8 +84,10 @@ How do we know 的顺序是「先想要什么证据,再想用什么取,再真取
 SKILL.md
 prompts/chain.md                       推导角提示词
 references/dbdog-tool-catalog.json     工具目录快照
-scripts/run.py                         入口
+scripts/run.py                         单用例入口
+scripts/batch.py                       批量入口(读 batch.md,顺序跑,写 batch-summary.md)
+batch.example.md                       批次文件模板
 scripts/check_chain.py                 产物校验(也可单独跑:python check_chain.py evidence-chain.json;打印四类取证结果计数)
 scripts/fetch-catalog.py               刷新工具目录
-scripts/run.test.py                    测试
+scripts/run.test.py / batch.test.py    测试
 ```

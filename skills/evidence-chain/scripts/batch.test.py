@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import tempfile
+import unittest
+
+import batch as b
+
+MANIFEST = """# 反向推导批次
+
+- 现象文件: {d}/reproduce.md
+- 根因文件: {d}/filter.md
+- 源码树: {d}/src
+- 输出目录: {d}/out
+- 间隔分钟: 0
+
+| 用例 | 事故窗 | 修复 | 备注 |
+|---|---|---|---|
+| DTS001 | 2026-09-09 09:04–09:07 (UTC+8),库 bench | https://dts.example.com/issue/001 | |
+| DTS002 | 2026-09-09 10:12–10:15 (UTC+8) | {d}/fix2.diff | 有 diff |
+| DTS003 | 2026-09-09 11:00–11:03 (UTC+8) | | 没根因 |
+"""
+
+REPRO = """# 复现用例集
+
+## DTS001 OR-EXISTS 慢查询
+诊断: 09:04–09:07 bench 库有条涉及 t0、t1 的查询很慢
+### 复现步骤
+create table ...
+
+## DTS002 锁等待
+诊断: 10:12 起大量会话卡住
+
+## DTS003 别的
+诊断: 内存涨
+"""
+
+FILTER = """# 根因集
+
+## DTS002
+### 根因
+autovacuum 与 DDL 互锁
+
+## DTS001
+### 根因
+sublink pull-up 未做代价判断
+### 现象量化
+- fast 0.514 ms / slow 860 ms
+"""
+
+
+class Manifest(unittest.TestCase):
+    def test_parse(self):
+        m = b.parse_manifest(MANIFEST.format(d="/x"))
+        self.assertEqual(m["settings"]["phenomenon_file"], "/x/reproduce.md")
+        self.assertEqual(m["settings"]["root_cause_file"], "/x/filter.md")
+        self.assertEqual(m["settings"]["source"], "/x/src")
+        self.assertEqual(m["settings"]["out"], "/x/out")
+        self.assertEqual(m["settings"]["interval_min"], 0.0)
+        self.assertEqual([c["id"] for c in m["cases"]], ["DTS001", "DTS002", "DTS003"])
+        self.assertEqual(m["cases"][0]["fix"], "https://dts.example.com/issue/001")
+        self.assertEqual(m["cases"][2]["fix"], "")
+        self.assertIn("库 bench", m["cases"][0]["window"])
+
+    def test_extract_by_heading(self):
+        ids = ["DTS001", "DTS002", "DTS003"]
+        s = b.extract_section(REPRO, "DTS001", ids)
+        self.assertIn("t0、t1", s); self.assertIn("复现步骤", s); self.assertNotIn("锁等待", s)
+        s2 = b.extract_section(FILTER, "DTS001", ids)
+        self.assertIn("pull-up", s2); self.assertIn("现象量化", s2); self.assertNotIn("autovacuum", s2)
+        self.assertIsNone(b.extract_section(FILTER, "DTS003", ids))
+
+    def test_extract_fallback_plain_lines(self):
+        text = "DTS001: 现象 A\n细节 a\nDTS002: 现象 B\n细节 b\n"
+        self.assertEqual(b.extract_section(text, "DTS001", ["DTS001", "DTS002"]).strip(), "DTS001: 现象 A\n细节 a")
+        self.assertEqual(b.extract_section(text, "DTS002", ["DTS001", "DTS002"]).strip(), "DTS002: 现象 B\n细节 b")
+
+    def test_fix_kind(self):
+        self.assertEqual(b.fix_kind("https://github.com/o/r/pull/1"), "diff_url")
+        self.assertEqual(b.fix_kind("https://gitee.com/o/r/pulls/1"), "diff_url")
+        self.assertEqual(b.fix_kind("https://dts.example.com/issue/1"), "ticket")
+        self.assertEqual(b.fix_kind("/x/fix.diff"), "file")
+        self.assertEqual(b.fix_kind(""), "none")
+
+    def test_dry_run_prepares_inputs_and_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
+            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
+            open(os.path.join(d, "fix2.diff"), "w", encoding="utf-8").write("--- a\n+++ b\n")
+            os.makedirs(os.path.join(d, "src"))
+            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d))
+            rows = b.run_batch(mp, dry_run=True)
+            st = {r["id"]: r["status"] for r in rows}
+            self.assertEqual(st, {"DTS001": "dry_run", "DTS002": "dry_run", "DTS003": "skipped_no_root_cause"})
+            c1 = os.path.join(d, "out", "DTS001")
+            self.assertIn("t0、t1", open(os.path.join(c1, "prompt.txt"), encoding="utf-8").read())
+            self.assertIn("pull-up", open(os.path.join(c1, "root-cause.md"), encoding="utf-8").read())
+            self.assertIn("09:04", open(os.path.join(c1, "window.txt"), encoding="utf-8").read())
+            self.assertTrue(os.path.isfile(os.path.join(d, "out", "batch-summary.md")))
+            summ = open(os.path.join(d, "out", "batch-summary.md"), encoding="utf-8").read()
+            self.assertIn("DTS003", summ); self.assertIn("根因", summ)
+
+
+if __name__ == "__main__":
+    unittest.main()

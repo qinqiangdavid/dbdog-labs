@@ -43,6 +43,25 @@ class Inputs(unittest.TestCase):
         self.assertEqual(ec.diff_url("https://x/y.diff"), "https://x/y.diff")
         self.assertEqual(ec.diff_url("https://github.com/o/r/commit/abc123"), "https://github.com/o/r/commit/abc123.diff")
         self.assertIsNone(ec.diff_url("/local/fix.diff"))
+        self.assertTrue(ec.is_ticket_url("https://dts.example.com/issue/123"))
+        self.assertFalse(ec.is_ticket_url("https://github.com/o/r/pull/12"))
+        self.assertFalse(ec.is_ticket_url("/local/fix.diff"))
+        self.assertIn("补丁", ec.html_to_text("<html><script>x()</script><body><h1>DTS-1</h1><p>补丁如下</p><pre>--- a</pre></body></html>"))
+
+    def test_ticket_in_case_md_and_webfetch(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, g, f, src = self._files(d)
+            work = ec.prepare_workdir(phenomenon=p, root_cause=g, fix_text=None, source=src, work=os.path.join(d, "w"),
+                                      ticket_url="https://dts.example.com/issue/1", ticket_text=None)
+            case = open(os.path.join(work, "case.md"), encoding="utf-8").read()
+            self.assertIn("dts.example.com/issue/1", case); self.assertIn("WebFetch", case)
+            self.assertIn("WebFetch", ec.claude_command("P", "claude")[ec.claude_command("P", "claude").index("--disallowedTools") + 1])
+            cmd = ec.claude_command("P", "claude", allow_webfetch=True)
+            self.assertNotIn("WebFetch", cmd[cmd.index("--disallowedTools") + 1])
+            work2 = ec.prepare_workdir(phenomenon=p, root_cause=g, fix_text=None, source=src, work=os.path.join(d, "w2"),
+                                       ticket_url="https://dts.example.com/issue/1", ticket_text="补丁正文 " * 50)
+            self.assertTrue(os.path.isfile(os.path.join(work2, "ticket.txt")))
+            self.assertIn("ticket.txt", open(os.path.join(work2, "case.md"), encoding="utf-8").read())
 
     def test_command_and_env(self):
         cmd = ec.claude_command("PROMPT", "claude")

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from html.parser import HTMLParser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
@@ -40,8 +41,13 @@ def write(path, text):
         f.write(text)
 
 
-def case_md(phenomenon_file, root_cause_file, window=None):
+def case_md(phenomenon_file, root_cause_file, window=None, ticket_url=None, ticket_text=None):
     out = ["# 反向输入", ""]
+    if ticket_url:
+        out += ["## 修复来源(问题单)", "", f"修复代码在这个问题单网页里:{ticket_url}",
+                ("其正文已抓成 `ticket.txt` 放在当前目录,先读它找修复代码/补丁;" if ticket_text else
+                 "本机抓不到该页面(可能要登录),请用 WebFetch 打开这个地址读修复代码/补丁;"),
+                "找不到修复代码就按 `fix_diff: absent` 处理。", ""]
     if window:
         out += ["## 事故窗(用例执行时间,取证一律用这个窗)", "", window.strip(), ""]
     out += ["## 现象(喂给被测 agent 的题面原话,即「诊断:」后面跟的那段)", "", read(phenomenon_file).strip(), ""]
@@ -62,9 +68,44 @@ def diff_url(fix):
     return fix
 
 
+class _Text(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.parts = []; self._skip = 0
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"): self._skip += 1
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip: self._skip -= 1
+        if tag in ("p", "div", "br", "li", "tr", "pre", "h1", "h2", "h3", "h4"): self.parts.append("\n")
+    def handle_data(self, data):
+        if not self._skip: self.parts.append(data)
+
+
+def html_to_text(html):
+    t = _Text(); t.feed(html)
+    return re.sub(r"\n{3,}", "\n\n", "".join(t.parts)).strip()
+
+
+def is_ticket_url(fix):
+    return bool(re.match(r"^https?://", fix or "")) and not re.search(r"\.(diff|patch)$", fix) \
+        and not re.search(r"(github\.com|gitee\.com)/[^/]+/[^/]+/(pull|pulls|commit)/", fix)
+
+
+def load_ticket(url):
+    """问题单网页(如 DTS):能下载就转成文本;下载不了(要登录)返回 None,由推导角自己打开。"""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "evidence-chain"}), timeout=30) as r:
+            body = r.read().decode("utf-8", "replace")
+        text = html_to_text(body) if "<" in body[:2000] else body
+        return text if len(text.strip()) > 200 else None
+    except Exception:
+        return None
+
+
 def load_fix(fix):
     if not fix:
         return None
+    if is_ticket_url(fix):
+        return None   # 问题单网页走 ticket 通道,见 main
     url = diff_url(fix)
     if url:
         log(f"下载修复 diff:{url}")
@@ -75,10 +116,12 @@ def load_fix(fix):
     return read(fix)
 
 
-def prepare_workdir(phenomenon, root_cause, fix_text, source, work=None, window=None):
+def prepare_workdir(phenomenon, root_cause, fix_text, source, work=None, window=None, ticket_url=None, ticket_text=None):
     work = work or tempfile.mkdtemp(prefix="evidence-chain-")
     os.makedirs(work, exist_ok=True)
-    write(os.path.join(work, "case.md"), case_md(phenomenon, root_cause, window))
+    write(os.path.join(work, "case.md"), case_md(phenomenon, root_cause, window, ticket_url, ticket_text))
+    if ticket_text:
+        write(os.path.join(work, "ticket.txt"), ticket_text)
     shutil.copyfile(root_cause, os.path.join(work, "root-cause.md"))
     if fix_text:
         write(os.path.join(work, "fix.diff"), fix_text)
@@ -88,8 +131,9 @@ def prepare_workdir(phenomenon, root_cause, fix_text, source, work=None, window=
     return work
 
 
-def claude_command(prompt_text, claude_bin, mcp_config=None):
-    cmd = [claude_bin, "-p", prompt_text, "--dangerously-skip-permissions", "--disallowedTools", DISALLOWED]
+def claude_command(prompt_text, claude_bin, mcp_config=None, allow_webfetch=False):
+    dis = DISALLOWED.replace("WebFetch,", "") if allow_webfetch else DISALLOWED
+    cmd = [claude_bin, "-p", prompt_text, "--dangerously-skip-permissions", "--disallowedTools", dis]
     if mcp_config:
         cmd += ["--mcp-config", mcp_config, "--strict-mcp-config"]
     return cmd
@@ -146,7 +190,7 @@ def main(argv=None):
     ap.add_argument("--phenomenon", "--prompt", dest="phenomenon", help="现象/题面文件(正向诊断用的提示词)")
     ap.add_argument("--root-cause", "--gt", dest="root_cause", help="根因文件(标准答案)")
     ap.add_argument("--window", help="事故窗/用例执行时间,原样交给推导角当查询窗(如 \"2026-09-09 09:04–09:07 UTC+8\");不给则从题目目录 window.txt 读")
-    ap.add_argument("--fix", help="修复 diff:本地文件,或 GitHub/Gitee 的 PR / commit 链接")
+    ap.add_argument("--fix", help="修复来源:本地 diff 文件、GitHub/Gitee 的 PR / commit 链接,或问题单网页地址(如 DTS 单,修复代码在页面里)")
     ap.add_argument("--mcp-config", help="dbdog MCP 配置 JSON(显式挂;不给则继承 config dir 里已配的 MCP)")
     ap.add_argument("--source", help="被测版本内核源码树目录(代码路径核实用)")
     ap.add_argument("--out", help="输出目录")
@@ -161,19 +205,24 @@ def main(argv=None):
     if os.path.isfile(target) and os.path.getsize(target) > 0 and not a.force:
         log(f"已在:{target}(--force 重跑)")
         return target
-    fix_text = load_fix(fix)
-    log("有修复 diff,先读 diff 再核源码" if fix_text else "无修复 diff,可信度按提示词规则降一档")
+    ticket_url = fix if is_ticket_url(fix or "") else None
+    ticket_text = load_ticket(ticket_url) if ticket_url else None
+    fix_text = None if ticket_url else load_fix(fix)
+    if ticket_url:
+        log(f"修复来源是问题单网页:{ticket_url}(" + ("已抓成 ticket.txt" if ticket_text else "抓不到,交给推导角用 WebFetch 打开") + ")")
+    else:
+        log("有修复 diff,先读 diff 再核源码" if fix_text else "无修复 diff,可信度按提示词规则降一档")
     if source and os.path.isdir(source):
         log(f"可读源码树:{source}")
     else:
         log("⚠ 没有源码树(--source / EVIDENCE_SOURCE_TREE),代码路径只能猜,verified 全为 false")
     if not a.window:
         log("⚠ 没有事故窗(--window),推导角只能按题面里的时间取证")
-    work = prepare_workdir(ph, gt, fix_text, source, window=a.window)
+    work = prepare_workdir(ph, gt, fix_text, source, window=a.window, ticket_url=ticket_url, ticket_text=ticket_text)
     claude_bin = find_claude()
     cfg = a.config_dir or os.environ.get("EVIDENCE_CONFIG_DIR") or None
     log(f"claude={claude_bin} · 模型档 {cfg or '<claude 默认>'} · 工作目录 {work}")
-    cmd = claude_command(read(PROMPT), claude_bin, a.mcp_config) + (["--model", a.model] if a.model else [])
+    cmd = claude_command(read(PROMPT), claude_bin, a.mcp_config, allow_webfetch=bool(ticket_url and not ticket_text)) + (["--model", a.model] if a.model else [])
     log("MCP:" + (a.mcp_config if a.mcp_config else "继承 config dir 已配的"))
     with open(os.path.join(work, "claude.stdout"), "w", encoding="utf-8") as so, \
          open(os.path.join(work, "claude.err"), "w", encoding="utf-8") as se:
