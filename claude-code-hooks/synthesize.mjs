@@ -4,7 +4,7 @@
 // 无法被 import 复用，只能整段搬家。
 import fs from "node:fs";
 import { hypothesisTags } from "./hypothesis.mjs";
-import { cap, contentCap, ctxBufCap, deriveSpanId, storeLlmInput } from "./lib.mjs";
+import { capField, deriveSpanId } from "./lib.mjs";
 
 /**
  * 从字节游标起读取完整行；返回 { lines, nextCursor }（未换行收尾的残行不消费）。
@@ -38,6 +38,15 @@ export function assistantText(content) {
     .join("\n");
 }
 
+/** assistant 消息里的 thinking 块全文（多块按出现顺序拼接；没有则空串）。 */
+export function thinkingText(content) {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((b) => (b?.type === "thinking" && typeof b.thinking === "string" ? b.thinking : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
 /** tool_result 的可读输出：string 直取；块数组取文本块，无文本块退回 JSON 串。 */
 export function toolResultText(content) {
   if (typeof content === "string") return content;
@@ -49,14 +58,6 @@ export function toolResultText(content) {
   } catch {
     return "";
   }
-}
-
-/** 截尾版 cap：每轮 prompt 的诊断价值在"新注入的尾部"（上下文为什么膨胀看的就是它），
- *  取后 contentCap 字符；头部（系统提示/初始 prompt）由 root/agent span 的 input 覆盖。 */
-export function capTail(s) {
-  if (typeof s !== "string") return null;
-  const c = contentCap();
-  return s.length > c ? s.slice(-c) : s;
 }
 
 /** 两个 ISO 时间戳的毫秒差；不可算（缺值/乱序）→ null。 */
@@ -91,33 +92,19 @@ export function extractLaunchedAgentId(toolUseResult, resultContent) {
  *
  * @param parentId  本批 span 挂的父节点（主线=root span；子代理=父侧 Agent tool span 的派生 id）
  * @param agent     非空表示正在处理子代理那份 transcript，span 上补 agent_id/agent_type
- * @param ctxBuf    上一批带来的滚动上下文缓冲（每轮 prompt 从这里截）
  * @param partialLlm 上一批尾组的延续信息（2026-08-14 codex 复审阻断项:同一 requestId 的
  *   多条 assistant 行被 Stop/SessionEnd 拆成两批读时,第二批若各自成组、用自己的 uuid 派生
  *   span_id,就是两条不同键的 llm span——usage 是逐行全量重复的,token 直接双计。
- *   延续信息 {rid, anchor, ts, start_ts, output}:第二批的首组若 requestId 与 rid 相同,
+ *   延续信息 {rid, anchor, ts, start_ts, output, thinking}:第二批的首组若 requestId 与 rid 相同,
  *   复用 anchor(同 span_id)与 ts(同排序键,后写赢真正折叠),output 前拼上前半段。）
  */
-export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent, ctxBuf, partialLlm }) {
+export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pendingToolUses, lastEntryTs, agent, partialLlm }) {
   const spans = [];
   const agentTags = agent ? { agent_id: agent.id, ...(agent.type ? { agent_type: agent.type } : {}) } : {};
   // 子代理 agent span 的 ts 与 input：实测子代理 transcript 首行即 type=user、
   // content 为字符串的那条 prompt。
   let firstEntryTs = null;
   let firstUserText = null;
-
-  // 每轮完整 prompt（DBDOG_OBS_STORE_LLM_INPUT，本地落盘）：按出现顺序把消息正文滚进
-  // 缓冲、只留尾部 ctxBufCap 字符——每轮 llm span 的 input_local 取"该轮模型调用之前的
-  // 快照"，截尾存。近似声明：系统提示不在 transcript 里（头部由 root/agent span 的
-  // input 覆盖）；tool_use 只留名字标记不进正文（参数在 tool span 里，重复存没意义）；
-  // 长度以 usage 的 token 计数为准，正文只是给复盘看内容。
-  let ctx = ctxBuf ?? "";
-  const ctxCap = ctxBufCap();
-  const pushCtx = (s) => {
-    if (!s) return;
-    const next = ctx ? `${ctx}\n${s}` : s; // 空缓冲首推不带前导换行
-    ctx = next.length > ctxCap ? next.slice(-ctxCap) : next;
-  };
 
   // 按 requestId 归并（实测坑，2026-07-09 首轮闭环发现）：一次 API 响应会按内容块拆成
   // 多条 assistant 行——requestId 相同、usage 逐行重复。一次模型调用 = 一个 llm span，
@@ -135,7 +122,6 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
     if (entry?.timestamp && firstEntryTs == null) firstEntryTs = entry.timestamp;
     if (firstUserText == null && entry?.type === "user" && typeof entry.message?.content === "string") {
       firstUserText = entry.message.content;
-      pushCtx(`[user]\n${entry.message.content}`);
     }
 
     if (entry?.type === "assistant" && Array.isArray(entry.message?.content)) {
@@ -152,7 +138,7 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
         }
         let inputJson = null;
         try {
-          inputJson = cap(JSON.stringify(args));
+          inputJson = JSON.stringify(args); // 全量进状态；落 span 时 capField 截断 + 本地副本
         } catch {
           /* 入参不可序列化就置空 */
         }
@@ -172,7 +158,6 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
         else {
           // 新组的时长近似起点 = 组首行之前那条 entry 的落盘时刻（通常是触发本次
           // 模型调用的 user/tool_result 行）。transcript 无请求发起时刻，这是下批近似。
-          // ctxSnapshot 取在本行内容入缓冲之前 = "该轮模型调用实际看到的上下文"。
           // anchor = span_id 的派生锚：优先 entry.uuid（实测每行都有，且跨进程稳定），
           // 退 requestId，再退行号（行号是 cursor 相对的，只在"同一 cursor 重复合成"
           // 这个场景里稳——那正是双注册的情形，够用）。
@@ -186,36 +171,24 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
                 anchor: partialLlm.anchor,
                 entries: [entry],
                 startTs: partialLlm.start_ts ?? null,
-                // 续写沿用**首批的**快照:本批 ctx 已滚入了同次调用的前半段输出,
-                // 再取当前 ctx 会把自己的 part1 混进 input_local,违反"调用前上下文"
-                // 语义(codex 二轮复审中危,纯函数反例属实)。
-                ctxSnapshot: null,
-                inputLocalOverride: partialLlm.input_local ?? null,
                 tsOverride: partialLlm.ts ?? null,
                 carriedOutput: partialLlm.output ?? "",
+                carriedThinking: partialLlm.thinking ?? "",
               }
             : {
                 rid,
                 anchor: entry.uuid ?? entry.requestId ?? `line-${i}`,
                 entries: [entry],
                 startTs: lastEntryTs,
-                ctxSnapshot: ctx,
               };
           groups.push(cur);
         }
       }
-      // 本轮输出进缓冲（下一轮的 prompt 包含它）；tool_use 只留名字标记，参数不入
-      pushCtx(`[assistant]\n${assistantText(entry.message.content)}`);
     }
 
     // tool_result 配对（在 user 行里；is_error 的失败调用照记——transport 断掉的
     // MCP 调用也在这里留痕，服务端视角反而看不见）
     if (entry?.type === "user" && Array.isArray(entry.message?.content)) {
-      // 本轮注入的内容先进缓冲（模型下一轮会看到）：tool_result 正文 + 夹带的文本块
-      for (const b of entry.message.content) {
-        if (b?.type === "tool_result") pushCtx(`[tool_result ${b.tool_use_id}]\n${toolResultText(b.content)}`);
-        else if (typeof b?.text === "string") pushCtx(`[user]\n${b.text}`);
-      }
       for (const b of entry.message.content) {
         if (b?.type !== "tool_result" || !b.tool_use_id) continue;
         const use = pendingToolUses.get(b.tool_use_id);
@@ -263,8 +236,8 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
           status: b.is_error ? "error" : "ok",
           ts: use.ts ?? entry.timestamp ?? new Date().toISOString(),
           duration_ms: msBetween(use.ts, entry.timestamp),
-          input: use.input,
-          output: cap(toolResultText(b.content)),
+          ...capField("input", use.input),
+          ...capField("output", toolResultText(b.content)),
           intent: use.intent || undefined,
           tokens_input: null,
           tokens_output: null,
@@ -298,8 +271,11 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       g.tsOverride ?? (duration != null ? g.startTs : first.timestamp) ?? new Date().toISOString();
     const newText = g.entries.map((e) => assistantText(e.message?.content)).filter(Boolean).join("\n");
     const emittedOutput = g.carriedOutput ? `${g.carriedOutput}\n${newText}` : newText;
+    const newThinking = g.entries.map((e) => thinkingText(e.message?.content)).filter(Boolean).join("\n");
+    const emittedThinking = g.carriedThinking ? `${g.carriedThinking}\n${newThinking}` : newThinking;
     g.emittedTs = emittedTs;
     g.emittedOutput = emittedOutput;
+    g.emittedThinking = emittedThinking;
     spans.push({
       trace_id: traceId,
       span_id: deriveSpanId(traceId, `llm:${g.anchor}`),
@@ -311,13 +287,12 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       status: "ok",
       ts: emittedTs,
       duration_ms: duration,
-      input: null, // 上报侧恒 null：远端只看 token；完整 prompt 走 input_local 纯本地
-      // input_local：该轮模型调用实际看到的上下文（截尾，contentCap 控制长度）。
-      // 开关 DBDOG_OBS_STORE_LLM_INPUT=0 可关；只在 spans.jsonl，reportSpans 前剥离。
-      ...(storeLlmInput()
-        ? { input_local: g.inputLocalOverride !== undefined ? (g.inputLocalOverride ?? "") : capTail(g.ctxSnapshot ?? "") }
-        : {}),
-      output: cap(emittedOutput),
+      // input 恒 null：每轮的完整 prompt = 之前全部对话，处理侧按 trace 内时间序从各 span
+      // 的正文复原即可，逐轮重复入盘是纯冗余（2026-08-10～09-08 的 input_local 实测占本地
+      // 文件 70%，已移除）。thinking 没有上报字段，只落本地全量。
+      input: null,
+      ...capField("output", emittedOutput),
+      ...(emittedThinking ? { thinking_local: emittedThinking } : {}),
       tokens_input: msg.usage.input_tokens ?? null,
       tokens_output: msg.usage.output_tokens ?? null,
       tokens_cache_read: msg.usage.cache_read_input_tokens ?? null,
@@ -334,8 +309,8 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
   }
 
   // 尾组延续信息：只有带真实 requestId 的组才可能被批界拆开（无 requestId 的行各自成组、
-  // 行本身不可再分——readNewLines 只消费完整行）。output 截尾防状态膨胀（cap 足够：
-  // 上报侧 output 本就 cap）。
+  // 行本身不可再分——readNewLines 只消费完整行）。output/thinking 全量随状态传递，
+  // 续批才能落出完整的本地副本（量级 = 一次模型响应，有界）。
   let partialOut = null;
   const tail = groups[groups.length - 1];
   if (tail && tail.entries[0].requestId) {
@@ -344,15 +319,10 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       anchor: tail.anchor,
       ts: tail.emittedTs,
       start_ts: tail.startTs ?? null,
-      output: cap(tail.emittedOutput ?? ""),
-      // 首批快照随延续信息传递(已 capTail ≤ contentCap,状态可控):续批的 input_local
-      // 必须仍是"本次调用之前"的上下文,不能取续批时已含 part1 的 ctx
-      input_local:
-        tail.inputLocalOverride !== undefined
-          ? (tail.inputLocalOverride ?? "")
-          : capTail(tail.ctxSnapshot ?? ""),
+      output: tail.emittedOutput ?? "",
+      thinking: tail.emittedThinking ?? "",
     };
   }
 
-  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf: ctx, partialLlm: partialOut };
+  return { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, partialLlm: partialOut };
 }

@@ -34,7 +34,7 @@ import {
   writeState,
   appendSpans,
   reportSpans,
-  cap,
+  capField,
   run,
   deriveSpanId,
   lookupSpans,
@@ -77,7 +77,7 @@ async function handleSubagent(input, main) {
   const selfSpanId = deriveSpanId(main.trace_id, agentId);
   const parentToolSpanId = deriveSpanId(main.trace_id, `tool:${agentId}`);
 
-  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf, partialLlm } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, partialLlm } = synthesize({
     lines,
     traceId: main.trace_id,
     sessionId: main.session_id ?? input.session_id,
@@ -86,7 +86,6 @@ async function handleSubagent(input, main) {
     pendingToolUses: new Map(Object.entries(sub.pending_tool_uses ?? {})),
     lastEntryTs: sub.last_entry_ts ?? null,
     agent: { id: agentId, type: input.agent_type ?? null },
-    ctxBuf: sub.ctx_buf ?? "",
     partialLlm: sub.partial_llm ?? null,
   });
 
@@ -106,8 +105,8 @@ async function handleSubagent(input, main) {
       status: "ok",
       ts: startedAt,
       duration_ms: msBetween(startedAt, lastEntryTs),
-      input: cap(prompt ?? ""),
-      output: cap(typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
+      ...capField("input", prompt ?? ""),
+      ...capField("output", typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
       tokens_input: null,
       tokens_output: null,
       tokens_cache_read: null,
@@ -131,7 +130,6 @@ async function handleSubagent(input, main) {
       started_at: startedAt ?? null,
       prompt: prompt ?? null,
       pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
-      ctx_buf: ctxBuf,
       // trace 归属固化（codex 复审阻断项）：SessionEnd 收尾时只认归属当前 trace 的子代理，
       // 不把上一条 trace 的子代理尾巴错挂进来。
       trace_id: main.trace_id,
@@ -172,7 +170,6 @@ async function flushCarry(input, state) {
     pendingToolUses: new Map(Object.entries(c.pending_tool_uses ?? {})),
     lastEntryTs: c.last_entry_ts ?? null,
     agent: null,
-    ctxBuf: "", // 收尾批不再滚上下文：input_local 由那条 trace 已发出的 llm span 覆盖
     partialLlm: c.partial_llm ?? null,
   });
   if (!spans.length) return true;
@@ -188,7 +185,7 @@ async function handleMain(input, state) {
   if (!transcript) return;
 
   const { lines, nextCursor } = readNewLines(transcript, state.cursor ?? 0);
-  const { spans, pendingToolUses, lastEntryTs, ctxBuf, partialLlm } = synthesize({
+  const { spans, pendingToolUses, lastEntryTs, partialLlm } = synthesize({
     lines,
     traceId: state.trace_id,
     sessionId: state.session_id,
@@ -197,7 +194,6 @@ async function handleMain(input, state) {
     pendingToolUses: new Map(Object.entries(state.pending_tool_uses ?? {})),
     lastEntryTs: state.last_entry_ts ?? null,
     agent: null,
-    ctxBuf: state.ctx_buf ?? "",
     partialLlm: state.partial_llm ?? null,
   });
   // 本轮新增的工具调用数（= 诊断有新进展的信号；纯 Q&A 回合无新工具，不触发总结重算）。
@@ -215,8 +211,8 @@ async function handleMain(input, state) {
     status: "ok",
     ts: state.started_at,
     duration_ms: state.started_at ? Date.now() - Date.parse(state.started_at) : null,
-    input: cap(state.prompt ?? ""),
-    output: cap(typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
+    ...capField("input", state.prompt ?? ""),
+    ...capField("output", typeof input.last_assistant_message === "string" ? input.last_assistant_message : ""),
     tokens_input: null,
     tokens_output: null,
     tokens_cache_read: null,
@@ -229,7 +225,6 @@ async function handleMain(input, state) {
   state.cursor = nextCursor;
   state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
-  state.ctx_buf = ctxBuf;
   state.partial_llm = partialLlm ?? null;
   state.pending_tool_uses = Object.fromEntries(
     [...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX),

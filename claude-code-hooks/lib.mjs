@@ -116,9 +116,8 @@ export async function reportSpans(spans) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", "DD-API-KEY": key },
-      // input_local（每轮完整 prompt，见 stop.mjs）是纯本地字段：远端只看树形与 token，
-      // 不推全文。pending 重发捞回本地 JSONL 的 span 同样带该字段，在这里一并剥掉。
-      body: JSON.stringify({ spans: spans.map(({ input_local, ...rest }) => rest) }),
+      // `*_local` 是纯本地全量字段（见 capField）：远端只收 contentCap 截断后的正文。
+      body: JSON.stringify({ spans: spans.map(stripLocal) }),
       signal: AbortSignal.timeout(reportTimeoutMs()),
     });
     return response.ok;
@@ -147,22 +146,19 @@ export function contentCap() {
 }
 
 /**
- * llm span 的每轮完整 prompt 是否落本地 JSONL（默认开；DBDOG_OBS_STORE_LLM_INPUT=0/off 关）。
- * 只进 spans.jsonl——reportSpans 上报前剥离，远端 schema 不动、带宽不浪费。
- * 目的：复盘"这个子代理/主线每轮到底看到了什么"，定位上下文膨胀与 token 去向。
+ * 本地全量、上报截断（2026-09-08）：正文字段远端只收 contentCap 截断值；超限时本地多落一份
+ * `<field>_local` 全量副本（未超限不落，读侧统一 `x_local ?? x`）。hook 只采原文不做语义
+ * 解析——提取（假设「提出」事件等）在处理侧做，处理侧因此必须拿得到全文。
  */
-export function storeLlmInput() {
-  const v = (process.env.DBDOG_OBS_STORE_LLM_INPUT ?? "1").trim().toLowerCase();
-  return v !== "0" && v !== "false" && v !== "off";
+export function capField(field, s) {
+  if (typeof s !== "string") return { [field]: null };
+  const c = contentCap();
+  return s.length > c ? { [field]: s.slice(0, c), [`${field}_local`]: s } : { [field]: s };
 }
 
-/**
- * 上下文滚动缓冲上限（字符，默认 200K ≈ 5 万 token 的尾部上下文）。每轮 prompt 从它截尾，
- * 同时防止状态文件随对话无限膨胀。调大只影响本地占盘，不影响上报。
- */
-export function ctxBufCap() {
-  const n = Number(process.env.DBDOG_OBS_CTX_BUF_CHARS ?? "");
-  return Number.isFinite(n) && n > 0 ? n : 200000;
+/** 剥掉所有 `*_local` 字段——上报前调用，远端 schema 不变、带宽不浪费。 */
+export function stripLocal(span) {
+  return Object.fromEntries(Object.entries(span).filter(([k]) => !k.endsWith("_local")));
 }
 
 export function cap(s) {
