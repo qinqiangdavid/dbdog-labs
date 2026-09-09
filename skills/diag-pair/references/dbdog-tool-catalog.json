@@ -1,0 +1,750 @@
+{
+ "source": "http://localhost:18090/mcp",
+ "fetched": "2026-09-08",
+ "tools": [
+  {
+   "name": "local_source_tree",
+   "description": "【非 dbdog 工具,是证据面】被测 openGauss 版本的内核源码树在本机(agent 的工作目录),允许用 Bash(grep/rg)、Grep、Read 直接检索源码:优化器(src/gausskernel/optimizer/{prep,plan,path,util})、执行器(src/gausskernel/runtime/executor)、GUC 定义(src/common/backend/utils/misc/guc*.cpp)、错误文本(errmsg)。用途:把\"计划长这样\"推进到\"为什么会长这样、有没有开关、是不是无条件\"。盲测只禁社区 issue/补丁/语料,不禁源码。",
+   "params": {
+    "pattern": "grep 的关键字(函数名、GUC 名、错误文本)",
+    "path": "源码子目录"
+   }
+  },
+  {
+   "name": "get_dbdog_metric",
+   "description": "Query metrics data from dbdog. Use response_format='timeseries' (default) to get time-indexed data points for graphs and trend analysis. Use response_format='scalar' to get a single aggregated value per group, useful for current state, summaries, and comparisons. For response_format='scalar', use structured query objects; the aggregator field controls how the time window collapses to a single value and defaults to avg if omitted. The query prefix, such as avg: or sum:, is not the scalar aggregator field. Supports multiple queries in one call plus formula expressions. Query syntax: grouping must come before modifiers, e.g. 'sum:trace.http.request.errors{env:prod} by {service}.as_count()', not",
+   "params": {
+    "formulas": "Optional. Formula expressions referencing queries by name. If no name was set, queries are named 'query0', 'query1', etc",
+    "from": "Start time. ISO 8601 ('2023-01-01T00:00:00Z'), Unix timestamp (seconds or ms), or relative ('now-1h', 'now-1d'). Default",
+    "interval": "Time interval in milliseconds for timeseries downsampling. May be overridden if the query would produce too many points.",
+    "max_tokens": "Max tokens in the response. Hard cap: 20000 (values above are clamped, not rejected).",
+    "queries": "Array of metric queries. Each element can be a raw dbdog query string (e.g. 'avg:system.cpu.user{env:prod} by {host}') o",
+    "raw_data": "Optional. For timeseries only. true=CSV raw data, false=binned stats (20 time buckets). Auto-selected if omitted.",
+    "response_format": "Optional. 'timeseries' (default): returns time-indexed data points per group, suitable for trend analysis and graphs. 's",
+    "telemetry": "",
+    "to": "End time. Same formats as 'from'. Default: now.",
+    "use_cloud_cost": "Set true to query Cloud Cost Management data instead of regular metrics. Cloud cost queries require space_aggregator='su"
+   }
+  },
+  {
+   "name": "aggregate_events",
+   "description": "Aggregate dbdog events to compute counts, sums, averages, min, max, cardinality, and percentiles (P50, P75, P90, P95, P99), with optional grouping by fields or time intervals. Use this for aggregated analysis such as event counts by source, event frequency over time, or grouped summaries across tags. For raw event inspection, titles/messages, or tag exploration, use search_dbdog_events.",
+   "params": {
+    "computes": "Required. Array of aggregation computations to perform. Each compute specifies a field, aggregation function, and output",
+    "from": "Optional. Start of the time window. Accepts ISO 8601, Unix epoch ms, or relative format (e.g. 'now-15m', 'now-1h'). Defa",
+    "group_by": "Optional. Grouping configuration. Specify 'fields' for field-based grouping and/or 'interval' for time-based histograms ",
+    "max_tokens": "Max tokens in the response. Hard cap: 20000 (values above are clamped, not rejected).",
+    "query": "Required. Search query to filter events before aggregation. Use dbdog query syntax. Examples: 'source:resource_changes',",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "Optional. End of the time window. Accepts ISO 8601, Unix epoch ms, or relative format (e.g. 'now'). Defaults to 'now'."
+   }
+  },
+  {
+   "name": "search_dbdog_events",
+   "description": "Search and retrieve raw dbdog events (deployments, alerts, system activities, infrastructure changes, etc.). Do NOT use for counts, aggregations, or grouped analysis — use aggregate_events instead. Best for: inspecting individual events, reading event titles/messages/tags, and exploring event patterns before deciding how to aggregate them. Supports complex queries with boolean operators and tag filtering. Results include event titles, messages, timestamps, and tags.",
+   "params": {
+    "from": "Optional. Start time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time ",
+    "max_tokens": "Max tokens in the response. Default: 10000. Hard cap: 20000 (values above are clamped, not rejected).",
+    "query": "Optional. Search query to filter events. Examples: 'source:resource_changes', 'env:prod', 'service:my_app error', 'foo b",
+    "sort": "Optional. Sort order. Accepts '-timestamp' or 'desc' for descending, and 'timestamp' or 'asc' for ascending. Defaults to",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "Optional. End time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time th"
+   }
+  },
+  {
+   "name": "get_change_stories",
+   "description": "Retrieve change events for an APM service over a time range. Use to correlate changes with performance issues, errors or incidents.\n\nTracked Change types: deployment (code/version), feature_flag, traffic_anomaly, watchdog (dbdog anomaly detection), kubernetes (k8s deployment manifest updates), scale (manual k8s scale events), crashloopbackoff (k8s crashloops), database (DB schema or setting changes), schema (data stream schemas only; not DB/API schema), configuration (limited to specific tracked sources — absence does not imply no config changed)",
+   "params": {
+    "context": "Why you are calling this tool.",
+    "end_ts": "End of time range (ISO 8601).",
+    "env": "Environment (e.g. 'prod'). Empty = all environments.",
+    "filter_tags": "key:value filter pairs (e.g. 'datacenter:us1.prod.dog').",
+    "max_tokens": "Max response tokens (default 10000).",
+    "service_name": "Service name.",
+    "start_ts": "Start of time range (ISO 8601, e.g. '2023-12-21T00:00:00Z').",
+    "story_types": "Types to include; empty = all.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "search_dbdog_metrics",
+   "description": "List available metrics in dbdog with optional filtering by name and tags. Set use_cloud_cost=true to search Cloud Cost Management metrics.",
+   "params": {
+    "from": "Lookback window start. ISO 8601, Unix timestamp, or relative ('now-2w', 'now-30d'). Max: 30 days.",
+    "include_top_tag_keys": "For regular metrics, include up to five commonly used tag keys per metric. Each result becomes an object with metric and",
+    "max_tokens": "Max tokens in the response.",
+    "name_filter": "Keyword search on metric name segments. For regular metrics, uses an OR policy: any matching token contributes to recall",
+    "percentiles_enabled": "Filter by percentile aggregation status. true=enabled, false=disabled, omit=all.",
+    "tag_filter": "Filter by tags within lookback window. Supports wildcards, AND, OR. Examples: 'service:redis* AND host:prod-1', 'service",
+    "telemetry": "",
+    "use_cloud_cost": "Set true to search Cloud Cost Management metrics instead of regular metrics. Cloud cost metric search only returns metri"
+   }
+  },
+  {
+   "name": "search_dbdog_monitors",
+   "description": "List and retrieve information about dbdog monitors. This tool helps discover monitors, their status, configuration, and alerts. Use this tool when you need to find monitors for investigation, management, or analysis purposes.",
+   "params": {
+    "include_tags": "Optional. List of monitor tag patterns to include in the response. Supports wildcards: 'env*' matches 'env:prod' and 'en",
+    "max_tokens": "Max tokens in the response. Default: 10000.",
+    "query": "Optional. Search query string. Supports filtering by id, title, status, team, priority, tag, etc. Examples: 'title:my-mo",
+    "sort": "Optional. Sort monitors by field. Valid values: 'title', 'status', 'tags'. Use a bare field name for ascending order (e.",
+    "start_at": "Offset for pagination.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "aggregate_spans",
+   "description": "Aggregate dbdog APM spans to compute counts, sums, averages, min, max, cardinality, and percentiles (P50, P75, P90, P95, P99), with optional grouping by fields or time intervals. Use this for aggregated analysis such as request counts over time, p95 duration by service or resource, or error counts grouped by endpoint or status code. For raw span inspection or to discover fields to group by or aggregate on, first use search_dbdog_spans and optionally request custom_attributes.",
+   "params": {
+    "computes": "Required. Array of aggregation computations to perform. Each compute specifies a field, aggregation function, and output",
+    "from": "Start of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or mill",
+    "group_by": "Optional. Grouping configuration. Specify 'fields' for field-based grouping and/or 'interval' for time-based histograms ",
+    "max_tokens": "Max tokens in the response.",
+    "query": "Required. Search query to filter spans before aggregation. Use dbdog query syntax. Examples: 'service:web-store', 'resou",
+    "sort": "Optional. Sorts the result by one compute from the 'computes' array. Defaults to sorting descending by the first compute",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "End of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or millis"
+   }
+  },
+  {
+   "name": "search_dbdog_entities",
+   "description": "Search dbdog services through the entity graph, including service ownership and direct upstream or downstream relationships. Prefer this tool over searching telemetry, monitors, dashboards, or other resources when the request is about service identity, catalog ownership, dependencies, or services owned by the current user's teams. Use entity_type=service directly for ordinary service lookup and dependency questions; kind: is added by the server. Ref, type, and type-specific identity fields are always returned, so omit fields for name-only discovery. Treat an unqualified list or dependency request as complete unless the user asks for a page or sample. Follow page_next_cursor from METADATA and",
+   "params": {
+    "entity_type": "Entity type to return.",
+    "fields": "Additional attributes to return only when needed. Service fields include display_name, description, owner, and links; te",
+    "max_tokens": "Approximate response token budget. The maximum is 20000. Hard cap: 20000 (values above are clamped, not rejected).",
+    "owned_by_current_user_teams": "For service searches, restrict results to the union of services owned by all teams the current user belongs to.",
+    "page": "Primary entity page size and opaque continuation cursor.",
+    "query": "Filter fragment without kind:. Service filters support name, display_name, team, and owner. Boolean expressions and wild",
+    "relationships": "Direct one-hop relationships to expand with bounded projections.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "search_dbdog_hosts",
+   "description": "Explore dbdog hosts inventory with SQL. Queries run against the virtual 'hosts' table backed by \"dd.hosts\" (Advanced Query API), which exposes hostname, hostname_aliases (text[]; use hostname_aliases[1]), tags (hstore map; use tags->'key'), cloud_provider, resource_type, instance_type, os, os_version, agent_version, memory_mib, cpu (hstore map; use cpu->'key'), kernel (hstore map; use kernel->'key'), sources (text[]; use sources[1]), modification_detected_at (timestamp). DDSQL notes: DDSQL (dbdog SQL) is a PostgreSQL subset: every non-aggregated SELECT column must appear in GROUP BY, SELECT aliases cannot be reused in WHERE/GROUP BY/HAVING (repeat the full expression instead, e.g., GROUP BY ",
+   "params": {
+    "max_tokens": "Max tokens in the response.",
+    "query": "SQL statement evaluated against the virtual 'hosts' table. Project columns, add WHERE clauses, group results, or order t",
+    "start_at": "Offset for pagination.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "search_dbdog_logs",
+   "description": "Search and retrieve raw log entries or log patterns. Do NOT use for counting or aggregations — use analyze_dbdog_logs instead. Best for: viewing raw logs, discovering patterns (use_log_patterns=true), and discovering custom attributes via extra_fields for use as extra_columns in analyze_dbdog_logs. Response shape (when extra_fields is set, output is YAML): three buckets — (1) top-level fields like env/host/service queried bare (`env:prod`); (2) `attributes:` map with source-prefixed keys — `custom.X` and `attributes.X` are queried as `@X` (strip the bucket prefix), but `error.X` keeps its prefix as `@error.X` because `error` is a real top-level attribute; (3) `tags:` list of `key:value` stri",
+   "params": {
+    "clustering_pattern_field": "Log field used for clustering logs with similar values when use_log_patterns is true. Can cluster on any attribute or ta",
+    "extra_fields": "Extra attributes/tags to include. Use bare names without '@' or prefix (e.g., 'duration', not '@duration' or 'custom.dur",
+    "from": "Start of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or mill",
+    "indexes": "Restrict to specific log indexes (e.g. ['main', 'pci']). Default: ['*'] (all).",
+    "limit": "Optional maximum number of logs or patterns to return (1-1000). If omitted, results are bounded only by max_tokens.",
+    "max_tokens": "Max tokens in the response. Hard cap: 20000 (values above are clamped, not rejected).",
+    "pattern_group_by": "Only used when use_log_patterns=true. Fields/tags to group patterns by (e.g. ['service', '@env']). Can group by any attr",
+    "query": "dbdog search query. Common tags: service, env, host, source. Prefix raw attributes with '@'. Examples: 'service:nginx st",
+    "sort": "Sort order. Default: -timestamp.",
+    "start_at": "Offset for pagination.",
+    "storage_tier": "Storage type. 'flex_and_indexes' (Flex + hot), 'online_archives_and_indexes' (archive + hot). Default: hot only.",
+    "telemetry": "",
+    "to": "End of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or millis",
+    "use_log_patterns": "When true, returns clusters of logs with similar messages instead of raw logs."
+   }
+  },
+  {
+   "name": "analyze_dbdog_logs",
+   "description": "Analyze dbdog logs using SQL. Runs against a virtual 'logs' table filtered by your search query. Good for aggregations, counts, group-bys, or peeking at recent logs with LIMIT. To discover custom attributes for extra_columns, first call search_dbdog_logs with extra_fields. If a query times out, try a shorter time range. MUST load the dbdog/ddsql skill before calling this tool.",
+   "params": {
+    "extra_columns": "Extend the logs table with additional typed columns. To discover available attributes, call search_dbdog_logs with extra",
+    "filter": "dbdog search query to filter logs before SQL analysis. Use key:value for tags/facets (e.g. 'service:nginx', 'env:prod'),",
+    "from": "Start of time window. ISO 8601, Unix epoch ms, or relative ('now-1h').",
+    "indexes": "Restrict to specific log indexes (e.g. ['main', 'pci']). Default: ['*'] (all).",
+    "max_tokens": "Max tokens in the response.",
+    "sql_query": "SQL against the 'logs' table. Examples: 'SELECT count(*) FROM logs', 'SELECT service, count(*) FROM logs GROUP BY servic",
+    "start_at": "Offset for pagination.",
+    "storage_tier": "Storage type: 'indexes' (default, hot only), 'flex_and_indexes' (Flex + hot). online-archives and cloudprem not supporte",
+    "telemetry": "",
+    "to": "End of time window. Same formats as 'from'."
+   }
+  },
+  {
+   "name": "get_dbdog_metric_context",
+   "description": "Get metadata (description, type, unit, integration), available tags/dimensions, and optionally related assets for a metric. Useful for exploring metrics before querying them. Set use_cloud_cost=true for Cloud Cost Management metrics.",
+   "params": {
+    "include_related_assets": "If true, includes dashboards, monitors, notebooks, and SLOs that use this metric. Not supported for cloud cost metrics.",
+    "include_tag_values": "If true, returns tags grouped by key with values ({'env': ['prod', 'staging']}). If false (default), returns only tag ke",
+    "max_tokens": "Max tokens in the response. Hard cap: 20000 (values above are clamped, not rejected).",
+    "metric_name": "Metric name. Examples: 'system.cpu.user', 'redis.info.latency_ms'. Cloud cost examples: 'all.cost', 'aws.cost.amortized'",
+    "scope_tags": "Tags to scope the metric before retrieving tags. Example: ['env:prod', 'region:us-east-1'] returns tags only from matchi",
+    "start_at": "Offset for pagination.",
+    "tag_filter": "Substring filter for tags. Example: 'prod' returns 'env:prod', 'service:prod-api', etc.",
+    "telemetry": "",
+    "use_cloud_cost": "Set true for Cloud Cost Management metrics. Examples: 'all.cost', 'aws.cost.amortized', 'aws.cost.net.amortized.shared.r",
+    "window": "Lookback window in seconds for tag data. Default: 14400 (4h), min: 14400, max: 2592000 (30d). Cloud cost uses fixed 7-da"
+   }
+  },
+  {
+   "name": "search_dbdog_dashboards",
+   "description": "List and retrieve information about dbdog dashboards. This tool helps discover available dashboards, their IDs, titles, and underlying queries. Use this tool when you need to find specific dashboards, get an overview of all dashboards in your dbdog account, or find important logs+metrics queries in dashboards.",
+   "params": {
+    "include_description": "Include the dashboard description.",
+    "include_template_variables": "Include information about template variables.",
+    "max_queries_per_dashboard": "Optional. Maximum number of queries to return per dashboard. Set to a higher value if you want to look up queries in das",
+    "max_tokens": "Optional. Maximum number of tokens to include in the response.",
+    "query": "Optional. Search query to filter dashboards. Supports:\n• Dashboard ID: 'id:ex2-43q-fiz'\n• Dashboard name: 'title:Redis',",
+    "sort": "Optional. Sort dashboards by field. Valid values: title, created_at, modified_at, popularity, metadata.widget_count, met",
+    "start_at": "Optional. Offset to start returning results from. Use this to get the next batch of results.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "get_dbdog_dashboard",
+   "description": "Retrieves a custom or integration dbdog dashboard by ID, returning its title, description, tags, widgets, and template variables. Use search_dbdog_dashboards first to find dashboard IDs.",
+   "params": {
+    "dashboard_id": "The custom dashboard short ID (e.g., 'ps7-mn3-kwf') or numeric integration dashboard ID (e.g., '30584').",
+    "include_widgets": "Whether to include widgets in the response. Defaults to true. Set to false for a lighter response with only dashboard me",
+    "telemetry": "",
+    "template_variable_values": "Optional template variable selections to apply to the returned dbdog UI link. These values affect only the link and do n"
+   }
+  },
+  {
+   "name": "load_dbdog_skill",
+   "description": "Load a dbdog skill guide before using related dbdog tools. Skills improve query quality by documenting the right attributes, syntax, and common pitfalls. Discover exact Skill names and headers through dbdog://mcp/skillsets or resources/list; do not guess names from topic keywords. Set header_only=true to preview a skill's summary, related skills, and bundled resources. Set resource_path to load a specific bundled reference.",
+   "params": {
+    "header_only": "If true, return skill name, description, related skills, and available bundled resources instead of full content. Defaul",
+    "resource_path": "Load a specific bundled resource file instead of the main skill content. Use header_only=true to discover available reso",
+    "skill_name": "The exact readable Skill name from dbdog://mcp/skillsets, resources/list, or a direct related link.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "aggregate_rum_events",
+   "description": "Aggregate dbdog RUM events to compute counts, sums, averages, min, max, cardinality, and percentiles (P50, P75, P90, P95, P99), with optional grouping by fields or time intervals. Use this for aggregated analysis of RUM data such as session counts over time, error counts by page, or p95 loading times by browser or URL path. For raw event inspection or attribute discovery, use search_dbdog_rum_events.",
+   "params": {
+    "computes": "Required. Array of aggregation computations to perform. Each compute specifies a field, aggregation function, and output",
+    "from": "Optional. Start of the time window. Accepts ISO 8601, Unix epoch ms, or relative format (e.g. 'now-1h', 'now-1d', 'now-7",
+    "group_by": "Optional. Grouping configuration. Specify 'fields' for field-based grouping and/or 'interval' for time-based histograms ",
+    "max_tokens": "Max tokens in the response.",
+    "query": "Required. Search query to filter events before aggregation. Use dbdog query syntax. RUM timing fields (e.g. `@view.loadi",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "Optional. End of the time window. Accepts ISO 8601, Unix epoch ms, or relative format (e.g. 'now'). Defaults to 'now'."
+   }
+  },
+  {
+   "name": "get_dbdog_incident",
+   "description": "Get detailed information about a specific dbdog incident by ID, including status, severity, timeline, associated users, and attachments.",
+   "params": {
+    "incident_id": "Incident ID — a number (e.g. 1239) or UUID.",
+    "include_attachments": "If true, includes postmortem link and/or external links.",
+    "include_follow_ups": "If true, fetches the follow-ups (action items / post-incident tasks) for this incident.",
+    "include_timeline": "If true, includes the incident timeline with comments and status changes.",
+    "max_tokens": "Max tokens in the response. Default: 10000.",
+    "telemetry": "",
+    "timeline_from": "Start of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or mill",
+    "timeline_to": "End of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or millis"
+   }
+  },
+  {
+   "name": "get_dbdog_notebook",
+   "description": "Retrieve information about a specific dbdog notebook by ID. This tool provides details including name, status, and associated author. The ID can also be extracted from a URL. The ID will be the last component, for example, <host>/notebook/<ID>.",
+   "params": {
+    "include_comments": "When true, fetch and include all comments for this notebook in the response. Comments are returned as a flat list; reply",
+    "max_tokens": "Max tokens in the response.",
+    "notebook_id": "The numeric ID of the notebook (e.g., '12345678'), or a notebook URL.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "get_dbdog_trace",
+   "description": "Retrieve a trace by trace ID from dbdog APM. This tool fetches all spans within a specific trace by default, providing detailed information about the request flow, timing, and service interactions. For large traces or to retrieve a summarized trace, set only_service_entry_spans=true to get a hierarchical condensed view that shows service boundaries, collapsing internal operations. The summarized view will indicate expandable spans with hidden_child_spans_count. The response includes a trace_deep_link_url in metadata that links directly to the trace flamegraph in the dbdog UI.",
+   "params": {
+    "expand_span_id": "Optional. Span ID to expand and show its hidden children. Use this when a span has hidden_child_spans_count > 0 to drill",
+    "extra_fields": "Optional. Additional meta or metrics tags to include beyond the default set (error.*, http.*, span.kind, rpc.*, grpc.*, ",
+    "include_path": "Optional. Array of strings. Each element is a 'key:value' pair used to filter spans; only matching spans and their ances",
+    "max_tokens": "Max tokens in the response. Default: 10000.",
+    "only_service_entry_spans": "Optional. If true, retrieve a summarized trace that collapses same-service chains so only service entry/exit spans remai",
+    "telemetry": "",
+    "trace_id": "Required. The trace ID to retrieve. Must be either 32 lowercase hex characters (e.g. '0123456789abcdef0123456789abcdef')"
+   }
+  },
+  {
+   "name": "search_dbdog_incidents",
+   "description": "Search dbdog incidents. Default sort: newest first. Supports filtering by state, severity, title, team, creation time, and more. Use `semantic_query` for natural-language search over AI-generated incident summaries. Prefer `query` first; only add `semantic_query` when query by keyword and metadata filters aren't sufficient to answer the question.",
+   "params": {
+    "from": "Start of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or mill",
+    "max_tokens": "Max tokens in the response. Default: 10000.",
+    "query": "Search query (default: 'state:active'). Supports booleans and parentheses. Examples: 'state:active severity:SEV-1', 'sta",
+    "semantic_query": "Semantic search over AI-generated incident summaries (root cause, system/customer impact, remediation). Matches by meani",
+    "sort": "Sort order. Ignored with with_facets. Values: -created (default), created, -declared, declared, -resolved, resolved, -mo",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "End of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or millis",
+    "with_facets": "If true, returns facet breakdowns (counts by severity, state, etc.) instead of individual incidents."
+   }
+  },
+  {
+   "name": "search_dbdog_notebooks",
+   "description": "Search dbdog notebooks. Use this tool when you need to find notebooks for investigation or monitoring purposes. Results can be filtered, for example by author, and sorted. This tool returns snippets of the original notebook. To fetch the entire notebook, use the get_dbdog_notebook tool.",
+   "params": {
+    "count": "Optional. Maximum number of notebook results to return. Must be between 1 and 1000.",
+    "filter": "Optional. Filter results by one or more of the following fields: author.handle, author, type, tags, metadata.has_computa",
+    "include_facets": "Optional. When true, the response includes facet aggregations (e.g. tags, author, type, template_variables) in the metad",
+    "max_tokens": "Max tokens in the response.",
+    "query": "Optional. Both notebook name and text content are searched when looking for keywords. All notebooks are returned by defa",
+    "sort": "Optional. Sort notebooks by field. Valid values: name, created_at, modified_at, deleted_at, favorited_by. Prefix with '-",
+    "start_at": "Offset for pagination.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "search_dbdog_rum_events",
+   "description": "Search and retrieve raw dbdog RUM events using advanced query syntax. Do NOT use for counts, aggregations, or grouped analysis. Best for: inspecting individual RUM events, debugging specific user experience issues, exploring available event attributes in raw or detailed_output responses before deciding what to aggregate. Supports filtering by event types (session, view, action, error, resource, long_task, vital, operation), user attributes, performance metrics, and more. Results include detailed event data for analysis.",
+   "params": {
+    "detailed_output": "Optional. If true, returns complete event data including all attributes, performance metrics, and metadata. If false, re",
+    "from": "Optional. Start time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative forma",
+    "max_tokens": "Optional. Maximum number of tokens to include in the response. Use higher values (50000+) for comprehensive analysis, lo",
+    "query": "Required. Search query following dbdog syntax. RUM timing fields (e.g. `@view.loading_time`, `@action.loading_time`, `@r",
+    "start_at": "Offset for pagination.",
+    "telemetry": "",
+    "to": "Optional. End time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative format "
+   }
+  },
+  {
+   "name": "search_dbdog_spans",
+   "description": "Retrieve raw dbdog APM spans matching a query. Do NOT use for counts, aggregations, or grouped analysis — use aggregate_spans instead. Best for: inspecting individual spans, debugging request flows and failures, and discovering span fields/attributes, including via custom_attributes, that you may want to aggregate or group by with aggregate_spans. IMPORTANT: When the user asks for 'security traces', 'AppSec traces', 'AAP traces', 'security activity', or 'security signals on traces', the query MUST start from `@appsec.security_activity:*`. Do NOT substitute keyword-based guesses like `service:*security*`, `resource_name:*auth*`, `@http.status_code:401`, etc. — those do not identify security t",
+   "params": {
+    "cursor": "Optional. Pagination cursor from a previous response's next_cursor, used to fetch the next page.",
+    "custom_attributes": "Optional. When omitted or empty, all custom attributes and tags are returned. When provided, limits custom attributes an",
+    "from": "Start of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or mill",
+    "limit": "Optional. Maximum number of spans to return (1-1000). Use this to reliably fetch a specific number of results, e.g. limi",
+    "max_tokens": "Max tokens in the response. Default: 10000. Hard cap: 20000 (values above are clamped, not rejected).",
+    "query": "Required. Query string, supports boolean operators (if not specified, AND is assumed) and parentheses. To search for tag",
+    "sort": "Optional. Sort order for spans. Default is -timestamp",
+    "telemetry": "",
+    "to": "End of the time range. Accepts ISO 8601 (e.g. '2024-01-01T00:00:00Z' or '2024-01-01'), Unix timestamp (seconds or millis"
+   }
+  },
+  {
+   "name": "find_dbdog_database_instances",
+   "description": "Discover and rank database instances for DBM investigation. USE THIS TOOL FIRST before calling other DBM tools that require a database_instance parameter.\n\nThis tool discovers database instances via trace/span correlation or tag matching, fetches telemetry for each instance, and uses LLM analysis to assess health and rank instances.\n\nProvide either:\n- trace_id and/or span_id from APM to find correlated database instances\n- tags to find matching instances (key:value format, ANDed together)\n- Both can be combined\n\nResponse includes database_instance identifiers, ranking with health assessment, timeframes for further analysis, and LLM analysis summary.",
+   "params": {
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "span_id": "APM span ID to find correlated database instances. Can be combined with tags.",
+    "tags": "Tags to filter database instances (key:value format, ANDed together). Common tags: database_instance:<hostname>, cluster",
+    "telemetry": "",
+    "time_hint": "Reference time in ISO 8601 format (e.g., '2024-01-15T10:30:00Z') or relative to now (e.g., 'now', 'now-1d'). Used to sco",
+    "trace_id": "APM trace ID to find correlated database instances. Can be combined with tags."
+   }
+  },
+  {
+   "name": "get_dbdog_database_query_performance",
+   "description": "Analyze a specific SQL query's performance — use when investigating slow queries, high database load, or resource-intensive queries. Returns throughput, average latency, execution time, rows per execution, cache hit ratio, I/O stats, connection activity, wait events, and transaction duration. Each metric includes overall statistics and time-bucketed analysis. Requires a query_signature and a database_instance.",
+   "params": {
+    "database_instance": "The database instance identifier. Must be a valid instance name returned by find_dbdog_database_instances.",
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "query_signature": "Query signature hash to analyze",
+    "telemetry": "",
+    "timeframe": "Time period to analyze with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z')"
+   }
+  },
+  {
+   "name": "get_dbdog_database_query_statement",
+   "description": "Retrieve the SQL statement text for a given query signature. The query signature is a stable hash fingerprint of the normalized SQL; use this tool to map signatures back to concrete SQL for investigation and reporting.",
+   "params": {
+    "database_instance": "The database instance identifier (optional, improves query accuracy). If provided, should be a valid instance name retur",
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "query_signature": "The query signature (hash fingerprint) to look up",
+    "telemetry": "",
+    "timeframe": "Time period to search within, with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z')"
+   }
+  },
+  {
+   "name": "get_dbdog_database_explain_plans",
+   "description": "Retrieve explain plans for a query or plan signature within a timeframe. Returns simplified plan structures optimized for analysis, including operator trees, index usage, estimated costs, and temporal metadata (first seen, last seen, occurrence count). Plans are sorted by estimated cost in descending order. When you already know the plan signature, pass plan_signature — a query-signature-only search returns at most the 50 most frequent plans and can miss a target, especially EXPLAIN ANALYZE plans which vary more than generic explains. Note: For SQL Server stored procedures with multiple statements, the simplified_plan field describes the first statement only; additional statements in the pro",
+   "params": {
+    "database_instance": "The database instance identifier. Must be a valid instance name returned by find_dbdog_database_instances.",
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "plan_signature": "The plan signature (hash fingerprint) of a specific execution plan to fetch. Prefer this when the target plan is already",
+    "procedure_signature": "The procedure signature (hash fingerprint) for SQL Server stored procedures. Required for SQL Server queries that are pa",
+    "query_signature": "The query signature (hash fingerprint) to look up explain plans for. At least one of query_signature, procedure_signatur",
+    "telemetry": "",
+    "timeframe": "Time period to search within, with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z')"
+   }
+  },
+  {
+   "name": "get_dbdog_database_schemas",
+   "description": "Fetch schema definitions (columns, indexes, foreign keys, partitions) for one or more database objects.\n\nAccepts a list of database objects with varying levels of specificity — from just a table name to a fully qualified table+schema+database+instance.\n\nReturns the current schema definitions. If investigating a past incident, schemas may have changed since then.\n\nFor openGauss instances each returned table additionally carries `compatibility` — the SQL compatibility mode of the DATABASE the table belongs to (pg_database.datcompatibility): A=Oracle (the openGauss default), B=MySQL, C=Teradata, PG=native PostgreSQL, D=SQL Server. This mode changes SQL SEMANTICS, so the very same statement retu",
+   "params": {
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "objects": "List of database objects to fetch schemas for. Each object must have at least a table name. Additional fields (schema, d",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "search_dbdog_database_samples",
+   "description": "Search and retrieve Database Monitoring (DBM) query samples from dbdog. Query samples represent individual query executions with performance metrics, allowing you to analyze database activity patterns, identify slow queries, and investigate database performance issues.",
+   "params": {
+    "from": "Optional. Start time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time ",
+    "limit": "Optional. Maximum number of samples to return per page (max: 100). Defaults to 25",
+    "max_tokens": "Optional. Maximum number of tokens to include in the response. Default is 10000",
+    "page_cursor": "Optional. Pagination cursor from a previous response's 'next_page_cursor' field. Use this to fetch the next page of resu",
+    "query": "Optional. Search query to filter DBM samples. Examples: 'host:db-prod-1', 'db:mydb', '@duration:>1000000000'. '*' to get",
+    "sort": "Optional. Sort order -- either '-timestamp' for descending or 'timestamp' for ascending. Defaults to '-timestamp'",
+    "start_at": "Optional. Offset to start returning results from. Use this to get the next batch of results when response is truncated d",
+    "telemetry": "",
+    "to": "Optional. End time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time th"
+   }
+  },
+  {
+   "name": "search_dbdog_database_plans",
+   "description": "Search and retrieve Database Monitoring (DBM) query execution plans from dbdog. Query execution plans show how the database engine executes queries, including index usage, join strategies, and cost estimates. Use this to analyze query performance and identify optimization opportunities.",
+   "params": {
+    "from": "Optional. Start time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time ",
+    "limit": "Optional. Maximum number of plans to return per page (max: 100). Defaults to 25",
+    "max_tokens": "Optional. Maximum number of tokens to include in the response. Default is 10000",
+    "page_cursor": "Optional. Pagination cursor from a previous response's 'next_page_cursor' field. Use this to fetch the next page of resu",
+    "query": "Optional. Search query to filter DBM plans. Examples: 'host:db-prod-1', 'db:mydb', '@duration:>1000000000'. '*' to get a",
+    "sort": "Optional. Sort order -- either '-timestamp' for descending or 'timestamp' for ascending. Defaults to '-timestamp'",
+    "start_at": "Optional. Offset to start returning results from. Use this to get the next batch of results when response is truncated d",
+    "telemetry": "",
+    "to": "Optional. End time in ISO 8601 format (e.g. '2023-01-01T00:00:00Z'), Unix timestamps (milliseconds), or relative time th"
+   }
+  },
+  {
+   "name": "get_dbdog_database_recommendations",
+   "description": "Retrieve live database recommendations for a database, query, table, host, or index. Returns the matching recommendations, current status, severity, raw recommendation context, and a normalized scope block that highlights affected database instances, query signatures, tables, indexes, services, plans, and infrastructure identifiers.",
+   "params": {
+    "database_instance": "The database instance identifier (optional, improves query accuracy).",
+    "database_type": "Optional database type filter. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB. Omitted, it defaults to P",
+    "entity": "Optional recommendation entity filter. This can be a query signature, index name, table name, or host identifier dependi",
+    "entity_type": "Optional entity type filter.",
+    "page_number": "Zero-based page number. Defaults to 0.",
+    "page_size": "Page size for the response. Defaults to 25 and is capped at 100.",
+    "query_signature": "Optional query signature filter.",
+    "recommendation_id": "Optional exact recommendation ID. When provided, the tool fetches that recommendation directly and ignores all other fil",
+    "recommendation_types": "Optional recommendation type filters. When omitted, defaults to all enabled recommendation types.",
+    "sort": "Optional sort string. Defaults to -severity,last_seen.",
+    "statuses": "Recommendation statuses to include. Defaults to [\"open\"].",
+    "tags": "Optional dbdog-style key:value tags. Multiple tags are ANDed together.",
+    "telemetry": "",
+    "timeframe": "Optional last_seen timeframe filter with 'from' and 'to' ISO 8601 fields."
+   }
+  },
+  {
+   "name": "optimize_dbdog_database_query",
+   "description": "Analyze a SQL query for optimization opportunities using deterministic rules plus LLM-assisted analysis. Returns actionable recommendations including query rewrites, anti-pattern detection (SELECT *, OFFSET without ORDER BY, ORDER BY without LIMIT), missing index suggestions, and idle-in-transaction impact analysis. Provide the SQL text directly, or a query_signature to resolve it automatically.\n\nScope of what each input unlocks:\n- sql alone is enough for the rule-based rewrite and anti-pattern optimizers AND for missing-index detection, which resolves the schema catalog itself and compares your predicates against the table's existing indexes. A query that was just written and has never run ",
+   "params": {
+    "database_instances": "List of database instance identifiers to scope the optimization. STRONGLY RECOMMENDED: Required for schema-aware optimiz",
+    "database_type": "Database type. Only PostgreSQL is currently supported by the optimization API (uses pg_query for parsing). 'OpenGauss' a",
+    "databases": "List of database names to scope the optimization. STRONGLY RECOMMENDED: Required for schema-aware optimizations like SEL",
+    "optimizations": "List of specific optimizations to run. Valid values: Rewrite, SelectStar, OffsetWithoutOrderBy, OrderByWithoutLimit, Mis",
+    "query_signature": "The query signature (hash fingerprint) of a query already observed running in a monitored database. Provide it when you ",
+    "sql": "The SQL query text to optimize. This is the primary input; provide it whenever you have the statement, including for a q",
+    "telemetry": "",
+    "timeframe": "Time period for analysis with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z'). Used when resolv"
+   }
+  },
+  {
+   "name": "get_dbdog_database_health_signals",
+   "description": "Run database health checks to identify potential issues. Returns evidence-based signals about database health including CPU saturation, restarts, query latency, blocking, and more. Compares a regression timeframe (showing the issue) against a baseline period.",
+   "params": {
+    "baseline_timeframe": "Baseline comparison period, with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:00:00Z')",
+    "database_instance": "The database instance identifier. Must be a valid instance name returned by find_dbdog_database_instances.",
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "query_signature": "Optional query signature for query-specific checks",
+    "regression_timeframe": "Time period showing the issue, with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z')",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "list_dbdog_database_optimizations",
+   "description": "List a database's ready-to-apply, benchmark-validated query optimizations — the same set shown on the dbdog DBM Optimizations page. Each entry carries a MEASURED improvement, so results can be ranked by impact.\n\nTHIS IS THE RIGHT TOOL whenever the user asks about optimizing queries: \"what query optimizations can I make\", \"the most impactful optimizations right now\", \"how do I make my queries/database faster\", or \"what should I optimize\". Prefer it over get_dbdog_database_recommendations — that tool covers broader database-HEALTH findings (unused indexes, long-running queries, low disk, connection saturation), not benchmark-proven query speedups. To generate a fresh, on-demand analysis for on",
+   "params": {
+    "database_instances": "Optional. Scope to optimizations for these database instance identifiers. Partial, case-insensitive match; multiple valu",
+    "databases": "Optional. Scope to optimizations for these logical database names. Partial, case-insensitive match; multiple values are ",
+    "limit": "Optional. Page size (optimizations per page). Defaults to 25; capped at 1000.",
+    "optimization_type": "Optional. Scope to a single class of optimization. \"Rewrite\" returns only query rewrites; \"MissingIndex\" returns only mi",
+    "page": "Optional. Zero-indexed page number. Defaults to 0 (first page). Walk 0..metadata.total_pages-1 to retrieve every optimiz",
+    "query_signatures": "Optional. Scope to optimizations for these query signatures. Exact match (query_signature is a precise hash), not partia",
+    "sort": "Optional. Ordering of results. \"-improvement\" (default) = highest measured improvement first; \"improvement\" = lowest fir",
+    "tables": "Optional. Scope to optimizations that touch these tables. Partial, case-insensitive match; multiple values are OR'd toge",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "get_dbdog_database_calling_services",
+   "description": "Identify upstream APM services and resources that call database queries. Use this tool to correlate database activity with application traces, enabling root cause analysis across the APM-database boundary. Returns the primary (most frequent) calling service and its associated resources.",
+   "params": {
+    "database_instance": "The database instance identifier. Must be a valid instance name returned by find_dbdog_database_instances.",
+    "database_type": "Database type. Use 'OpenGauss' for openGauss instances, 'GaussDB' for GaussDB.",
+    "query_signature": "Optional query signature to filter results to a specific query",
+    "telemetry": "",
+    "timeframe": "Time period to search within, with 'from' and 'to' fields in ISO 8601 format (e.g., '2024-01-15T10:30:00Z')"
+   }
+  },
+  {
+   "name": "ddsql_run_query",
+   "description": "Run a DDSQL query and return results. Recommended flow: (1) call ddsql_get_spec, (2) call ddsql_schema_search_tables, (3) for data tables use entries in tables: if searchable=true, call ddsql_schema_search_unstructured_fields first and fall back to ddsql_schema_get_table_columns; if searchable=false, call ddsql_schema_get_table_columns, (4) for metrics use entries in metrics: each item is a metric name (for example system.cpu.user); use that name in meta.metrics_query_format_doc examples to build dd.metrics_scalar(...) or dd.metrics_timeseries(...), then execute ddsql_run_query.",
+   "params": {
+    "from": "Start of the request-level time range. A DDSQL table function's from_timestamp/to_timestamp pair takes precedence over t",
+    "sql_query": "Required. DDSQL query to execute. Prefer tables/fields discovered via the DDSQL schema tools.",
+    "telemetry": "",
+    "to": "End of the request-level time range. A DDSQL table function's from_timestamp/to_timestamp pair takes precedence over the"
+   }
+  },
+  {
+   "name": "ddsql_get_spec",
+   "description": "Get a compact DDSQL capability spec with supported SQL functions, SQL keywords, and DDSQL-specific deltas from vanilla PostgreSQL. Start with this tool before composing queries, then use ddsql_schema_search_tables and ddsql_schema_get_table_columns for schema discovery.",
+   "params": {
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_schema_search_tables",
+   "description": "Search DDSQL datasets across four providers: public tables, reference tables, metrics, and published analyses. Results are returned in three TSV sections: tables (public + reference_tables), metrics, and published_analyses. Each table, metrics, or published_analyses row includes a `searchable` flag: for `searchable=true` entries, try ddsql_schema_search_unstructured_fields first to discover dynamic unstructured fields, then fall back to ddsql_schema_get_table_columns for static columns. For `searchable=false` entries, use ddsql_schema_get_table_columns directly. Use per-provider limits and offsets to control result size and paginate through results. Setting a provider's limit to 0 will skip ",
+   "params": {
+    "metrics_limit": "Optional. Limit the number of metrics results to return. Default is 10. Maximum is 100. Set to 0 to skip querying the me",
+    "metrics_offset": "Optional. Number of metrics results to skip, for pagination. Default is 0.",
+    "public_limit": "Optional. Limit the number of public table results to return. Default is 10. Maximum is 100. Set to 0 to skip querying t",
+    "public_offset": "Optional. Number of public tables results to skip, for pagination. Default is 0.",
+    "published_analysis_limit": "Optional. Limit the number of published analysis results to return. Default is 10. Maximum is 100. Set to 0 to skip quer",
+    "published_analysis_offset": "Optional. Number of published analysis results to skip, for pagination. Default is 0.",
+    "query": "Optional. Search query applied to public, reference_tables, and metrics providers.",
+    "reference_tables_limit": "Optional. Limit the number of reference table results to return. Default is 10. Maximum is 100. Set to 0 to skip queryin",
+    "reference_tables_offset": "Optional. Number of reference tables results to skip, for pagination. Default is 0.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_schema_get_table_columns",
+   "description": "Get static SQL columns for a DDSQL table from schema metadata. Use this after ddsql_schema_search_tables for entries in tables where searchable=false, or as fallback when ddsql_schema_search_unstructured_fields is unavailable for searchable entries. Returns compact column metadata: name, ddsql_type (SQL-layer type — use for DDSQL queries and PTF AS(column TYPE) casts), and analysis_type (structured-output type — use for advanced_query structured output, never in SQL).",
+   "params": {
+    "table_id": "Required. Table identifier: the id from ddsql_schema_search_tables results, or a SQL table name (e.g. \"aws.iam_role\").",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_schema_search_unstructured_fields",
+   "description": "Search and rank fields for an unstructured DDSQL source. Use this after ddsql_schema_search_tables for entries where searchable=true as the primary schema-discovery path; results include both common static and dynamic fields. If unavailable, fall back to ddsql_schema_get_table_columns. Returns compact field metadata sorted by frequency: name, ddsql_type (SQL-layer type — use for PTF AS(column TYPE) casts and all DDSQL queries), and analysis_type (structured-output type — use for advanced_query structured output, never in SQL). Also returns source-specific PTF query guidance when available. Supports optional pagination via offset (default 0) and limit (default 10, max 100) parameters. Pass li",
+   "params": {
+    "field_query": "Optional. Field-name query used to filter ranked fields.",
+    "limit": "Optional. Limit the number of results to return. Default is 10. Maximum is 100.",
+    "offset": "Optional. Offset to start the search from. Default is 0.",
+    "query": "Optional. EVP filter context using key:value pairs (for example: 'service:billing status:error'). Keys correspond to fie",
+    "source_id": "Required. Public source ID/FQDN in the format public.dd.<dataset> (for example: public.dd.logs).",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_create_link",
+   "description": "Generate a dbdog UI link to the DDSQL editor with the given query pre-populated.",
+   "params": {
+    "sql_query": "Required. DDSQL query to encode in the link.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_search_saved_queries",
+   "description": "Search and list saved DDSQL queries. Use to find existing saved queries by name or description. Results are sorted by most recently modified and include query ID, name, SQL text, columns, visibility, description and author/timestamp metadata. Supports optional text filtering and pagination.",
+   "params": {
+    "filter": "Optional. Text filter to narrow results by query name or description. Multiple words are ANDed together.",
+    "page_number": "Optional. Non-negative page number for pagination.",
+    "page_size": "Optional. Positive number of results to return per page. Maximum is 500.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_read_saved_query",
+   "description": "Read a single saved DDSQL query by its query_id. Returns the full saved query record, including dataset_id, name, SQL text, columns, visibility, description, and author/timestamp metadata.",
+   "params": {
+    "query_id": "Required. ID of the saved query to read.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "ddsql_upsert_saved_query",
+   "description": "Create or update a saved DDSQL query. To create a new query, provide name and query without query_id — if the user has not specified a name, generate a concise descriptive name based on the query content before calling this tool. To update an existing query, provide query_id together with name and/or query; for partial updates, missing fields are preserved from the existing record. Returns the full saved query record on success. Any other combination of inputs returns an error.",
+   "params": {
+    "name": "Optional. Name of the saved query. Required for create; optional for update. If the user has not provided a name, genera",
+    "query": "Optional. The DDSQL query to save. Required for create; optional for update.",
+    "query_id": "Optional. ID of the saved query. Required for update; omit to create a new query.",
+    "telemetry": ""
+   }
+  },
+  {
+   "name": "get_profiling_services",
+   "description": "\n\t\t\tReturns profiled services along with their profiling families that\n\t\t\tcan be queried for profiling data in the given query context.\n\n\t\t\tNote: results are in no particular order and do not indicate relative importance or activity level of services.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "get_profiling_runtime_ids",
+   "description": "\n\t\t\tReturns individual profiled runtime IDs (processes/containers).\n\t\t\tThese are exact strings that can't be changed.\n\t\t\tFor family, don't use ebpf.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "limit": "Maximum number of runtime IDs to return. Defaults to 1 (the one with most CPU).",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "get_profiling_profile_types",
+   "description": "\n\t\t\tReturns profile types and families that can be used by other profiling tools given a query context.\n\t\t\tYou can either query by tags (queryString + timeFrame) or by trace context.\n\t\t\tWhen using trace context, the tool will find profiles associated with that specific trace and span.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "spanId": "Span ID for trace-to-profile correlation. Must be provided with traceId and timeHint.",
+    "telemetry": "",
+    "timeHint": "Epoch timestamp in seconds for trace-to-profile correlation. Must be provided with traceId and spanId.",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "traceId": "Trace ID for trace-to-profile correlation. Must be provided with spanId and timeHint."
+   }
+  },
+  {
+   "name": "get_profiling_tag_names",
+   "description": "\n\t\t\tDiscover available tag names (e.g. service, host, env, version, family, runtime-id) from the profile metadata track.\n\t\t\tUse this to find what tags are available for filtering profiling data.\n\t\t\tCommon infrastructure tags include pod_name, container_id, container_name, availability-zone, datacenter, kube_deployment, kube_namespace.\n\t\t\tReturns at most 50 results sorted by relevance to the search parameter.\n\t\t\tUse the search parameter to narrow down results when looking for a specific tag.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "search": "Prefix filter to narrow down tag names.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "get_profiling_tag_values",
+   "description": "\n\t\t\tGet the values for a specific tag (e.g. service, host, env, version, family, runtime-id) from the profile metadata track.\n\t\t\tUse get_profiling_tag_names first to discover available tags.\n\t\t\tReturns at most 50 results sorted by frequency.\n\t\t\tUse the valueSearch parameter to narrow down results when looking for a specific value.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "tagName": "The tag name to get values for.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "valueSearch": "Prefix search to filter values."
+   }
+  },
+  {
+   "name": "get_profiling_fields",
+   "description": "\n\t\t\tDiscover available fields and facets that can be used for filtering and grouping profiling data.\n\t\t\tUse this to find what groupBy or filter fields are available for get_profiling_timeseries queries.\n\t\t\tReturned fields only applicable to get_profiling_timeseries queries.\n\t\t\tReturns an object with a \"fields\" array. Each element has:\n\t\t\t- \"type\": one of \"frame\" (stack frame attributes like function, file, package), \"top_frame\" (top-of-stack frame), \"top_mycode_frame\" (top user-code frame), \"context\" (label-based context like endpoint), \"unknown\"\n\t\t\t- \"path\": the field path to use in queries and groupBy (e.g. \"@stack.function\", \"@labels.trace_endpoint\")\n\t\t\t- \"display_name\": human-readable na",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "sampleType": "The sample type to discover fields for.",
+    "search": "Optional prefix filter for field names.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "get_profiling_timeseries",
+   "description": "\n\t\t\tQuery profiling data as timeseries, aggregated into time buckets.\n\t\t\tUse this to analyze trends, compare services, or identify performance regressions over time.\n\t\t\tWell suited for cross-service investigations — use groupBy to group by different fields, e.g. service or frame name or library.\n\t\t\tFor single-service deep dives into stacktraces or call graphs, use explore_profiling_flame_graph or explore_profiling_call_graph.\n\n\t\t\tThe profileType determines what is measured (all are RATES, not accumulated totals):\n\t\t\t- \"cpu-time\": CPU utilization rate. Unit: nanocores (1 core = 1,000,000,000 nanocores). Example: 5,700,000,000 nanocores = 5.7 CPU cores in use. This is NOT time — do NOT convert",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "groupBy": "Field to group results by.",
+    "groupByLimit": "Maximum number of groups when using groupBy. Defaults to 10.",
+    "intervalSeconds": "Bucket interval in seconds. If omitted, auto-computed to approximately 10 data points.",
+    "profileType": "Profile type to query: cpu-time, wall-time, alloc-size, alloc-samples.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "explore_profiling_flame_graph",
+   "description": "\n\t\t\tObtain a list of top stacktraces based on their value contribution for the provided profile type.\n\t\t\tBest suited for investigating a single service at a time. For cross-service comparisons, use get_profiling_timeseries.\n\n\t\t\tThings of note:\n\t\t\t* Pay special attention to mentions of endpoints, attributes or stacktrace fields in the request.\n\t\t\t  This tool supports filtering to those fields for more specific queries.\n\t\t\t* Provide traceContext OR scope by service via queryString (e.g. service:my-svc).\n\t\t\t* Stacktrace frames are ordered from caller to callee, with the more specific frame being the last\n\t\t\t  in the list.\n\t\t\t* For Chrome profiles (family:chrome in filter.query):\n\t\t\t  - Endpoint",
+   "params": {
+    "attribute": "Attribute used for exploring attribute values or applying attributeRegexFilter.",
+    "attributeRegexFilter": "Only samples associated with attribute values matching this regex are considered.",
+    "endpointRegexFilter": "Only samples associated with endpoints matching this regex are considered.",
+    "frameRegexFilter": "Only stacktraces with frames matching this regex are considered.",
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "profileType": "profileType to explore",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "spanId": "Span ID for trace-to-profile correlation. Must be provided with traceId and timeHint.",
+    "telemetry": "",
+    "timeHint": "Epoch timestamp in seconds for trace-to-profile correlation. Must be provided with traceId and spanId.",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "traceId": "Trace ID for trace-to-profile correlation. Must be provided with spanId and timeHint."
+   }
+  },
+  {
+   "name": "explore_profiling_call_graph",
+   "description": "\n\t\t\tExplore a call graph to identify hot call relationships for the provided profile type.\n\t\t\tBest suited for investigating a single service at a time. For cross-service comparisons, use get_profiling_timeseries.\n\n\t\t\tThings of note:\n\t\t\t* Provide traceContext OR scope by service via queryString (e.g. service:my-svc).\n\t\t\t* Nodes represent frames/functions and edges represent call relationships (caller -> callee)\n\t\t\t* sortedNodes is ordered by self value; use node id and edge targetId to link nodes\n\t\t\t* Defaults: top 20 nodes, 5% cumulative cutoff, top 5 edges per node\n\t\t\t* Use get_profiling_tag_names/get_profiling_tag_values to discover available tags and their values for filtering in queryStr",
+   "params": {
+    "frameFilter": "Optional glob pattern matched against frame fields.",
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "profileType": "profileType to explore",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "spanId": "Span ID for trace-to-profile correlation. Must be provided with traceId and timeHint.",
+    "telemetry": "",
+    "timeHint": "Epoch timestamp in seconds for trace-to-profile correlation. Must be provided with traceId and spanId.",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "traceId": "Trace ID for trace-to-profile correlation. Must be provided with spanId and timeHint."
+   }
+  },
+  {
+   "name": "explore_profiling_rum_flamegraph",
+   "description": "\n\t\t\tReturns a flamegraph for profiles scoped to RUM events matching a given metric and optional filter.\n\t\t\tWorks with any RUM-instrumented platform (browser, mobile, etc.) — use the family and service that match the instrumented application.\n\t\t\tUse this tool when the user asks which functions are responsible for a slow RUM metric (e.g. INP, LCP, time spent on a page, long tasks).\n\t\t\tDo NOT use explore_profiling_flame_graph for RUM metrics — it does not understand RUM event types and will produce wrong results.\n\n\t\t\tHow it works:\n\t\t\t* You provide rumMetric and optionally rumQuery to scope which RUM events are considered.\n\t\t\t* The backend resolves the matching RUM event IDs server-side and fetc",
+   "params": {
+    "family": "Profile family matching the RUM-instrumented platform (e.g. \"chrome\" for browser, \"android\", \"ios\").",
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "profileType": "Profile type to explore (e.g. \"wall-time\").",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "rumMetric": "RUM metric: INP, LCP, FCP, LOADING_TIME, TIME_SPENT, ACTION_LOADING_TIME, VITAL_DURATION, or LONG_TASK_DURATION.",
+    "rumQuery": "Optional RUM filter query (e.g. \"@view.name:/profiling/explorer\"). @profiling.has_profile:true is appended automatically",
+    "service": "Service name.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "explore_profiling_timeline",
+   "description": "\n\t\t\tAnalyze timeline activity showing lane groups (threads, GC, etc.) and their CPU/I/O activities.\n\t\t\tBest suited for investigating a single service instance at a time. For cross-service comparisons, use get_profiling_timeseries.\n\t\t\tUse for general thread analysis, or enable critical path (traceContext only) to identify latency bottlenecks.\n\n\t\t\tKey points:\n\t\t\t* Provide runtimeId OR traceContext (required)\n\t\t\t* Time values in nanoseconds. Example: 1700000000 ns = 1.7 seconds. 260000000 ns = 26 milliseconds.\n\t\t\t* Use get_profiling_tag_names/get_profiling_tag_values to discover available tags and their values for filtering in queryString.\n\t\t\t  Syntax: tag:value pairs separated by spaces (impli",
+   "params": {
+    "focusEventType": "Event type to prioritize lanes by.",
+    "focusLaneGroup": "Lane group name to focus on.",
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "runtimeId": "Runtime ID.",
+    "spanId": "Span ID for trace-to-profile correlation. Must be provided with traceId and timeHint.",
+    "telemetry": "",
+    "timeHint": "Epoch timestamp in seconds for trace-to-profile correlation. Must be provided with traceId and spanId.",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "traceId": "Trace ID for trace-to-profile correlation. Must be provided with spanId and timeHint.",
+    "useCriticalPath": "Use critical path analysis (trace context only)."
+   }
+  },
+  {
+   "name": "get_profiling_service_insights",
+   "description": "\n\t\t\tReturns insights over the provided time window.\n\t\t\tThese insights contain:\n\t\t\t- A high-level summary explaining the issue and why it matters\n\t\t\t- Contextual insights from profiling data (for example, affected methods, packages, or processes)\n\t\t\t- Recommended next steps to help you resolve the issue\n\n\t\t\t* Use get_profiling_tag_names/get_profiling_tag_values to discover available tags and their values for filtering in queryString.\n\t\t\t  Syntax: tag:value pairs separated by spaces (implicit AND), tag:(v1 OR v2) for alternatives, -tag:value for negation, tag:prefix* for wildcards.\n",
+   "params": {
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "limit": "Maximum number of raw insights to use in report. Defaults to 20.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now."
+   }
+  },
+  {
+   "name": "get_profiling_field_values",
+   "description": "\n\t\t\tGet the values for a specific profiling field/facet discovered via get_profiling_fields.\n\t\t\tUse this to discover what values a particular field has (e.g. all endpoint values, all function names).\n\t\t\tReturned field values only applicable to get_profiling_timeseries queries.\n\t\t\tFor tag values (service, host, env, etc.) use get_profiling_tag_values instead.\n\t\t\tReturns an array of objects, each with:\n\t\t\t- \"field\": the value string (e.g. \"web-server\", \"us-east-1\"). This can be used to construct filter queries in get_profiling_timeseries\n\t\t\t- \"value\": the count/frequency of that value in the profiling data. Estimation, used only for ordering, not to be used to compute any actual values, ignore",
+   "params": {
+    "fieldPath": "The field path to get values for.",
+    "fromString": "Optional. Start time in ISO 8601, Unix milliseconds, or relative now- time. Defaults to now-1h.",
+    "limit": "Maximum number of values to return. Defaults to 25.",
+    "queryString": "Optional. dbdog query string used to filter profiling data matching tags.",
+    "telemetry": "",
+    "toString": "Optional. End time in ISO 8601, Unix milliseconds, or relative now time. Defaults to now.",
+    "valueSearch": "Optional filter for field values."
+   }
+  }
+ ]
+}
