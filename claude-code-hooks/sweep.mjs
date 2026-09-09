@@ -19,7 +19,7 @@
 // 用法：node sweep.mjs（SessionStart hook 会 detached 起它，也可手动跑）
 import fs from "node:fs";
 import path from "node:path";
-import { obsDir, spansPath, reportSpans, run } from "./lib.mjs";
+import { obsDir, lookupSpans, reportSpans, run } from "./lib.mjs";
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
@@ -56,27 +56,6 @@ function isSubagentState(fileName) {
   return fileName.slice(0, -".json".length).includes(".");
 }
 
-/** span_id → span 全文。懒建：pending 里若全是旧格式全文就不必读 spans.jsonl。 */
-function buildSpanIndex() {
-  const index = new Map();
-  let text;
-  try {
-    text = fs.readFileSync(spansPath(), "utf8");
-  } catch {
-    return index; // 没有本地 JSONL 就查不回来，按缺失处理
-  }
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    try {
-      const span = JSON.parse(line);
-      if (span?.span_id) index.set(span.span_id, span);
-    } catch {
-      /* 容忍脏行 */
-    }
-  }
-  return index;
-}
-
 run(async () => {
   const dir = obsDir();
   let entries;
@@ -90,8 +69,11 @@ run(async () => {
   // 任何情况下都不得删。
   const stateFiles = entries.filter((f) => f.endsWith(".json"));
   const now = Date.now();
-  let index = null;
 
+  // 第一遍：挑出可接管的状态文件，收集全部待回捞的 span_id——spans.jsonl 只流式扫一次，
+  // 不管有几个积压文件（实测一台机器 7 个）。
+  const jobs = [];
+  const wantedIds = [];
   for (const fileName of stateFiles) {
     const file = path.join(dir, fileName);
     let stat;
@@ -109,32 +91,44 @@ run(async () => {
     } catch {
       continue; // 坏文件不动，留给人看
     }
-
     const pending = Array.isArray(state.pending_spans) ? state.pending_spans : [];
-    if (pending.length) {
-      // 新格式存 span_id（状态文件因此从数百 KB 降到几百字节），旧格式直接躺着全文
-      const spans = pending
-        .map((item) => {
-          if (typeof item !== "string") return item;
-          if (!index) index = buildSpanIndex();
-          return index.get(item) ?? null;
-        })
-        .filter(Boolean);
+    for (const item of pending) if (typeof item === "string") wantedIds.push(item);
+    jobs.push({ file, fileName, idleMs, state, pending });
+  }
+  const index = new Map((await lookupSpans(wantedIds)).map((s) => [s.span_id, s]));
 
+  for (const { file, fileName, idleMs, state, pending } of jobs) {
+    if (pending.length) {
+      // 新格式存 span_id（状态文件因此从数百 KB 降到几百字节），旧格式直接躺着全文。
+      // 回捞不到的（本地 JSONL 已被轮转/删除）没法再发，从 pending 里去掉。
+      const resolved = pending
+        .map((item) => ({ item, span: typeof item === "string" ? (index.get(item) ?? null) : item }))
+        .filter((r) => r.span);
+
+      // 分批发；每批成功立即把剩余部分写回状态文件（2026-09-08）——此前一批失败整体留着，
+      // 前面成功的批次下次原样重发，慢链路上每轮从头撞、永远收敛不了。
       let allSent = true;
-      for (let i = 0; i < spans.length; i += BATCH) {
-        if (!(await reportSpans(spans.slice(i, i + BATCH)))) {
+      for (let i = 0; i < resolved.length; i += BATCH) {
+        if (!(await reportSpans(resolved.slice(i, i + BATCH).map((r) => r.span)))) {
           allSent = false;
-          break; // 一批失败就整体留着下次再来——宁可重发，不可丢
+          break; // 本批失败：进度停在上一批，剩下的下次再来——宁可重发，不可丢
+        }
+        state.pending_spans = resolved.slice(i + BATCH).map((r) => r.item);
+        try {
+          fs.writeFileSync(file, JSON.stringify(state));
+        } catch {
+          /* 写不动就下次再来 */
         }
       }
       if (!allSent) continue;
-
-      state.pending_spans = [];
-      try {
-        fs.writeFileSync(file, JSON.stringify(state));
-      } catch {
-        /* 写不动就下次再来 */
+      if (!resolved.length) {
+        // 全部回捞不到：pending 已无意义，清空让文件按 TTL 走
+        state.pending_spans = [];
+        try {
+          fs.writeFileSync(file, JSON.stringify(state));
+        } catch {
+          /* 写不动就下次再来 */
+        }
       }
       continue; // 刚写过，mtime 已刷新，本轮不再考虑删除
     }

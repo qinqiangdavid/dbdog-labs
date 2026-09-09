@@ -13,7 +13,7 @@
 // 用法：node summary-worker.mjs <sessionId>
 import fs from "node:fs";
 import path from "node:path";
-import { obsDir, readState, spansPath, appendSpans, reportSpans, deriveSpanId, pendingIds, run, writeState } from "./lib.mjs";
+import { obsDir, readState, scanSpans, appendSpans, reportSpans, deriveSpanId, pendingIds, run, writeState } from "./lib.mjs";
 import { trimSpans, buildPrompt, generateSummary, summaryEnv } from "./summary.mjs";
 
 const SUMMARY_KIND = "workflow";
@@ -74,26 +74,15 @@ async function main(sessionId) {
   // · 原始行数 = 快照水位。水位必须按**行数**而非去重后 span 数（codex 二轮复审阻断项）：
   //   SessionEnd 的 root 刷新/跨批续写都是同键追加行，去重数不变——完整快照与残缺快照
   //   水位相等的话，旧 worker 仍能后写覆盖。行数只增不减，完整快照恒压过残缺快照。
+  // 流式扫描（2026-09-08）：只保留本 trace 的 span，不整文件读进内存（本 worker 每有新工具
+  // 调用就起一个，旧实现每次全量读 376MB）。
   let watermark = 0;
   const byId = new Map();
-  let text;
-  try {
-    text = fs.readFileSync(spansPath(), "utf8");
-  } catch {
-    return; // 没有本地 JSONL 就没有素材
-  }
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    let span;
-    try {
-      span = JSON.parse(line);
-    } catch {
-      continue; // 容忍脏行
-    }
-    if (span?.trace_id !== state.trace_id || !span.span_id) continue;
+  await scanSpans((span) => {
+    if (span.trace_id !== state.trace_id) return;
     watermark++;
     byId.set(span.span_id, span);
-  }
+  });
   const spans = [...byId.values()];
   if (spans.length === 0) return;
 

@@ -34,9 +34,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   appendSpans,
-  cap,
+  capField,
   deriveSpanId,
-  lookupSpans,
   obsDir,
   pendingIds,
   readState,
@@ -99,16 +98,19 @@ function lastAssistantText(lines) {
   return "";
 }
 
-/** 落盘 + 分批上报；返回未送达的 span_id 列表（含 carriedOverIds 里重发失败的）。 */
+/**
+ * 落盘 + 分批上报本轮新 span；返回未送达的 span_id 列表。积压（carriedOverIds）原样带回、
+ * 不在这里重发（与 stop.mjs emit 同理，2026-09-08）：本流程末尾会 detached 起 sweep，
+ * 由它分批补发；SessionEnd 30s 预算只用来收本会话的尾。
+ */
 async function emitBatched(spans, carriedOverIds) {
   appendSpans(spans);
-  const batch = [...lookupSpans(carriedOverIds), ...spans];
   const failed = [];
-  for (let i = 0; i < batch.length; i += BATCH) {
-    const part = batch.slice(i, i + BATCH);
+  for (let i = 0; i < spans.length; i += BATCH) {
+    const part = spans.slice(i, i + BATCH);
     if (!(await reportSpans(part))) failed.push(...part.map((s) => s.span_id));
   }
-  return failed;
+  return [...carriedOverIds, ...failed];
 }
 
 /** carry 收尾：与 stop.mjs flushCarry 同构（SessionEnd 也可能是交界后的第一个事件）。 */
@@ -134,7 +136,6 @@ async function flushCarry(input, state) {
     pendingToolUses: new Map(Object.entries(c.pending_tool_uses ?? {})),
     lastEntryTs: c.last_entry_ts ?? null,
     agent: null,
-    ctxBuf: "",
     partialLlm: c.partial_llm ?? null,
   });
   if (!spans.length) return true;
@@ -163,10 +164,9 @@ async function flushMainTail(input, state) {
   let spans = [];
   let pendingToolUses = new Map(Object.entries(state.pending_tool_uses ?? {}));
   let lastEntryTs = state.last_entry_ts ?? null;
-  let ctxBuf = state.ctx_buf ?? "";
   let partialLlm = state.partial_llm ?? null;
   if (lines.length) {
-    ({ spans, pendingToolUses, lastEntryTs, ctxBuf, partialLlm } = synthesize({
+    ({ spans, pendingToolUses, lastEntryTs, partialLlm } = synthesize({
       lines,
       traceId: state.trace_id,
       sessionId: state.session_id,
@@ -175,7 +175,6 @@ async function flushMainTail(input, state) {
       pendingToolUses,
       lastEntryTs,
       agent: null,
-      ctxBuf,
       partialLlm,
     }));
   }
@@ -197,8 +196,8 @@ async function flushMainTail(input, state) {
       status: "ok",
       ts: state.started_at, // 与 Stop 的 root 同键同 ts，后写赢
       duration_ms: msBetween(state.started_at, lastEntryTs),
-      input: cap(state.prompt ?? ""),
-      output: cap(lastText),
+      ...capField("input", state.prompt ?? ""),
+      ...capField("output", lastText),
       tokens_input: null,
       tokens_output: null,
       tokens_cache_read: null,
@@ -213,7 +212,6 @@ async function flushMainTail(input, state) {
   state.cursor = nextCursor;
   state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
-  state.ctx_buf = ctxBuf;
   state.partial_llm = partialLlm ?? null;
   state.pending_tool_uses = Object.fromEntries(
     [...(pendingToolUses instanceof Map ? pendingToolUses.entries() : Object.entries(pendingToolUses))].slice(-PENDING_TOOL_USE_MAX),
@@ -277,7 +275,7 @@ async function flushSubagents(input, state) {
 
     const selfSpanId = deriveSpanId(state.trace_id, agentId);
     const parentToolSpanId = deriveSpanId(state.trace_id, `tool:${agentId}`);
-    const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, ctxBuf, partialLlm } = synthesize({
+    const { spans, pendingToolUses, lastEntryTs, firstEntryTs, firstUserText, partialLlm } = synthesize({
       lines,
       traceId: state.trace_id,
       sessionId: state.session_id ?? sessionId,
@@ -286,7 +284,6 @@ async function flushSubagents(input, state) {
       pendingToolUses: new Map(Object.entries(sub.pending_tool_uses ?? {})),
       lastEntryTs: sub.last_entry_ts ?? null,
       agent: { id: agentId, type: agentType },
-      ctxBuf: sub.ctx_buf ?? "",
       partialLlm: sub.partial_llm ?? null,
     });
 
@@ -308,8 +305,8 @@ async function flushSubagents(input, state) {
         status: "ok",
         ts: startedAt,
         duration_ms: msBetween(startedAt, lastEntryTs),
-        input: cap(prompt ?? ""),
-        output: cap(lastText),
+        ...capField("input", prompt ?? ""),
+        ...capField("output", lastText),
         tokens_input: null,
         tokens_output: null,
         tokens_cache_read: null,
@@ -334,7 +331,6 @@ async function flushSubagents(input, state) {
         started_at: startedAt ?? null,
         prompt: prompt ?? null,
         pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
-        ctx_buf: ctxBuf,
         trace_id: state.trace_id,
         partial_llm: partialLlm ?? null,
       },

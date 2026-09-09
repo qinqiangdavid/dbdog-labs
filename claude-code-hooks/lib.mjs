@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 
 /** 状态/产物目录（主会话一个状态文件 + 每子代理一个 + 共享 spans.jsonl）。 */
 export function obsDir() {
@@ -61,35 +62,46 @@ export function appendSpans(spans) {
 }
 
 /**
- * span_id → span 全文的索引，读自本地 spans.jsonl（真相源）。
- * 状态文件里的 pending 只存 span_id、不存副本——旧格式直接塞全文，实测把单个状态
- * 文件撑到 315 KB（每条 span 的 input/output 上限 8000 字符）。
+ * 流式扫描本地 spans.jsonl（真相源）：逐行 JSON.parse 后回调 visit(span)，脏行跳过，
+ * 文件不存在则一次都不回调。绝不整文件读进内存——实测 376MB 的 spans.jsonl 让
+ * readFileSync+split 的旧实现常驻 2GB、跑 57s，再涨到 Node 字符串上限直接抛（hook 吞错，
+ * 补发与总结静默失效）。调用方只保留自己要的那几条（sweep 按 pending id、worker 按 trace）。
  */
-export function spanIndex() {
-  const index = new Map();
-  let text;
+export async function scanSpans(visit) {
+  let stream;
   try {
-    text = fs.readFileSync(spansPath(), "utf8");
+    stream = fs.createReadStream(spansPath(), { encoding: "utf8" });
   } catch {
-    return index; // 没有本地 JSONL 就捞不回来
+    return;
   }
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    try {
-      const span = JSON.parse(line);
-      if (span?.span_id) index.set(span.span_id, span);
-    } catch {
-      /* 容忍脏行 */
+  try {
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      let span;
+      try {
+        span = JSON.parse(line);
+      } catch {
+        continue; // 容忍脏行
+      }
+      if (span?.span_id) visit(span);
     }
+  } catch {
+    /* 文件不存在 / 读到一半出错：按缺失处理，调用方拿到的是已扫到的部分 */
+  } finally {
+    stream.destroy();
   }
-  return index;
 }
 
-/** 按 span_id 捞回全文，保持传入顺序；捞不到的丢弃（本地 JSONL 已被轮转/删除）。 */
-export function lookupSpans(ids) {
+/** 按 span_id 捞回全文（同 id 多行取最后一行 = 后写赢），保持传入顺序；捞不到的丢弃。 */
+export async function lookupSpans(ids) {
   if (!ids?.length) return [];
-  const index = spanIndex();
-  return ids.map((id) => index.get(id)).filter(Boolean);
+  const wanted = new Set(ids);
+  const found = new Map();
+  await scanSpans((span) => {
+    if (wanted.has(span.span_id)) found.set(span.span_id, span);
+  });
+  return ids.map((id) => found.get(id)).filter(Boolean);
 }
 
 /** 兼容两种 pending 格式：新的字符串 id、旧的 span 全文对象。统一成 id 列表。 */
@@ -116,9 +128,8 @@ export async function reportSpans(spans) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", "DD-API-KEY": key },
-      // input_local（每轮完整 prompt，见 stop.mjs）是纯本地字段：远端只看树形与 token，
-      // 不推全文。pending 重发捞回本地 JSONL 的 span 同样带该字段，在这里一并剥掉。
-      body: JSON.stringify({ spans: spans.map(({ input_local, ...rest }) => rest) }),
+      // `*_local` 是纯本地全量字段（见 capField）：远端只收 contentCap 截断后的正文。
+      body: JSON.stringify({ spans: spans.map(stripLocal) }),
       signal: AbortSignal.timeout(reportTimeoutMs()),
     });
     return response.ok;
@@ -147,22 +158,19 @@ export function contentCap() {
 }
 
 /**
- * llm span 的每轮完整 prompt 是否落本地 JSONL（默认开；DBDOG_OBS_STORE_LLM_INPUT=0/off 关）。
- * 只进 spans.jsonl——reportSpans 上报前剥离，远端 schema 不动、带宽不浪费。
- * 目的：复盘"这个子代理/主线每轮到底看到了什么"，定位上下文膨胀与 token 去向。
+ * 本地全量、上报截断（2026-09-08）：正文字段远端只收 contentCap 截断值；超限时本地多落一份
+ * `<field>_local` 全量副本（未超限不落，读侧统一 `x_local ?? x`）。hook 只采原文不做语义
+ * 解析——提取（假设「提出」事件等）在处理侧做，处理侧因此必须拿得到全文。
  */
-export function storeLlmInput() {
-  const v = (process.env.DBDOG_OBS_STORE_LLM_INPUT ?? "1").trim().toLowerCase();
-  return v !== "0" && v !== "false" && v !== "off";
+export function capField(field, s) {
+  if (typeof s !== "string") return { [field]: null };
+  const c = contentCap();
+  return s.length > c ? { [field]: s.slice(0, c), [`${field}_local`]: s } : { [field]: s };
 }
 
-/**
- * 上下文滚动缓冲上限（字符，默认 200K ≈ 5 万 token 的尾部上下文）。每轮 prompt 从它截尾，
- * 同时防止状态文件随对话无限膨胀。调大只影响本地占盘，不影响上报。
- */
-export function ctxBufCap() {
-  const n = Number(process.env.DBDOG_OBS_CTX_BUF_CHARS ?? "");
-  return Number.isFinite(n) && n > 0 ? n : 200000;
+/** 剥掉所有 `*_local` 字段——上报前调用，远端 schema 不变、带宽不浪费。 */
+export function stripLocal(span) {
+  return Object.fromEntries(Object.entries(span).filter(([k]) => !k.endsWith("_local")));
 }
 
 export function cap(s) {

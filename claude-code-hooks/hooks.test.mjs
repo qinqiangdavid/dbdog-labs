@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { hypothesisTags, parseIntent } from "./hypothesis.mjs";
+import { scanSpans } from "./lib.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -358,14 +359,16 @@ describe("Stop hook span synthesis", () => {
   });
 });
 
-// —— llm span 本地完整 prompt（input_local，2026-08-10）——
-// 上报侧 input 恒 null，完整 prompt 只在 spans.jsonl 里（DBDOG_OBS_STORE_LLM_INPUT 可关），
-// reportSpans 前剥离。快照取"该轮模型调用之前的滚动上下文"，截尾存。
-describe("llm span 本地完整 prompt", () => {
-  it("accumulates the context per round into input_local, tool_use args excluded", () => {
-    const dir = tempObsDir();
-    const transcript = writeTranscript(dir, "t.jsonl", [
-      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+// —— 本地全量、上报截断（2026-09-08）——
+// 原则：hook 只采原文不做语义解析，提取放处理侧。本地 spans.jsonl 是真相源，正文一律全量；
+// 上报侧维持 contentCap 截断。超限的字段在本地多落一份 `<字段>_local`（未超限不落副本，
+// 读侧统一 `x_local ?? x`）；thinking 没有上报字段，只有 thinking_local。
+// 任何 `*_local` 字段 reportSpans 前剥离。旧的 input_local（每轮上下文尾部快照）整段移除：
+// 它的内容全是前面 span 已有正文的重复拼接，实测占本地文件 70%。
+describe("本地全量、上报截断", () => {
+  function longTranscript(dir, { text, thinking, args, result, prompt = "诊断: 为什么卡住" }) {
+    return writeTranscript(dir, "t.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: prompt } },
       {
         type: "assistant",
         timestamp: T("05.000"),
@@ -374,107 +377,120 @@ describe("llm span 本地完整 prompt", () => {
           model: "m",
           usage: { input_tokens: 3, output_tokens: 50 },
           content: [
-            { type: "text", text: "先看进程" },
-            { type: "tool_use", id: "tu_local", name: "Bash", input: { command: "ls" } },
+            ...(thinking ? [{ type: "thinking", thinking, signature: "sig" }] : []),
+            { type: "text", text },
+            { type: "tool_use", id: "tu_local", name: "Bash", input: args },
           ],
         },
       },
       {
         type: "user",
         timestamp: T("07.500"),
-        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_local", content: "file1\nfile2" }] },
-      },
-      {
-        type: "assistant",
-        timestamp: T("20.000"),
-        requestId: "req_2",
-        message: { model: "m", usage: { input_tokens: 2, output_tokens: 80 }, content: [{ type: "text", text: "结论如下" }] },
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_local", content: result }] },
       },
     ]);
-    seedState(dir, "s1", transcript);
+  }
 
-    runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "结论如下" }, dir);
-    const llm = readSpans(dir).filter((s) => s.kind === "llm");
-    expect(llm).toHaveLength(2);
-    // 第 1 轮的 prompt = 初始用户消息（快照取在本次输出入缓冲之前）
-    expect(llm[0].input_local).toBe("[user]\n诊断: 为什么卡住");
-    // 上报视角 input 恒 null，不随 input_local 变化
-    expect(llm[0].input).toBeNull();
-    // 第 2 轮的 prompt = 初始消息 + 第 1 轮输出 + tool_result 注入
-    expect(llm[1].input_local).toContain("[user]\n诊断: 为什么卡住");
-    expect(llm[1].input_local).toContain("[assistant]\n先看进程");
-    expect(llm[1].input_local).toContain("[tool_result tu_local]\nfile1\nfile2");
-    // tool_use 只留名字标记，参数不进缓冲（tool span 已存全文）
-    expect(llm[1].input_local).toContain("[tool_use: Bash]");
-    expect(llm[1].input_local).not.toContain('"command"');
-  });
-
-  it("caps the context buffer and tail-caps the snapshot", () => {
+  it("llm span 采 thinking 块进 thinking_local（全量），text 仍走 output", () => {
     const dir = tempObsDir();
-    const transcript = writeTranscript(dir, "t.jsonl", [
-      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "A".repeat(60) } },
-      {
-        type: "assistant",
-        timestamp: T("05.000"),
-        requestId: "req_1",
-        message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
-      },
-    ]);
+    const transcript = longTranscript(dir, { text: "先看进程", thinking: "T".repeat(30), args: { command: "ls" }, result: "ok" });
     seedState(dir, "s1", transcript);
     runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" }, dir, {
-      DBDOG_OBS_CTX_BUF_CHARS: "40",
       DBDOG_OBS_CONTENT_CHARS: "10",
     });
     const llm = readSpans(dir).find((s) => s.kind === "llm");
-    // 缓冲截尾（"[user]\n" + 60 个 A → 剩尾部 40 个 A），快照再截尾到 contentCap=10
-    expect(llm.input_local).toBe("A".repeat(10));
+    expect(llm.thinking_local).toBe("T".repeat(30)); // 不受 contentCap 约束
+    // 文本块 + tool_use 名字标记（既有语义）；本用例 contentCap=10，读侧口径 x_local ?? x
+    expect(llm.output_local ?? llm.output).toBe("先看进程\n[tool_use: Bash]");
+    expect(llm.thinking).toBeUndefined(); // 没有上报字段
   });
 
-  it("omits input_local when DBDOG_OBS_STORE_LLM_INPUT=0", () => {
+  it("超限正文本地落全量副本：llm output_local、tool input_local/output_local；未超限不落副本", () => {
     const dir = tempObsDir();
-    const transcript = writeTranscript(dir, "t.jsonl", [
-      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
-      {
-        type: "assistant",
-        timestamp: T("05.000"),
-        requestId: "req_1",
-        message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
-      },
-    ]);
+    const transcript = longTranscript(dir, {
+      text: "A".repeat(30),
+      args: { command: "x".repeat(30) },
+      result: "R".repeat(30),
+    });
     seedState(dir, "s1", transcript);
     runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" }, dir, {
-      DBDOG_OBS_STORE_LLM_INPUT: "0",
+      DBDOG_OBS_CONTENT_CHARS: "10",
     });
-    expect(readSpans(dir).find((s) => s.kind === "llm").input_local).toBeUndefined();
+    const spans = readSpans(dir);
+    const llm = spans.find((s) => s.kind === "llm");
+    expect(llm.output).toBe("A".repeat(10));
+    expect(llm.output_local).toBe("A".repeat(30) + "\n[tool_use: Bash]");
+    const tool = spans.find((s) => s.kind === "tool");
+    expect(tool.input).toBe(JSON.stringify({ command: "x".repeat(30) }).slice(0, 10));
+    expect(tool.input_local).toBe(JSON.stringify({ command: "x".repeat(30) }));
+    expect(tool.output).toBe("R".repeat(10));
+    expect(tool.output_local).toBe("R".repeat(30));
+
+    // 未超限：远端字段已是全量，不落副本
+    const dir2 = tempObsDir();
+    const t2 = longTranscript(dir2, { text: "短", args: { c: 1 }, result: "ok" });
+    seedState(dir2, "s2", t2);
+    runHook("stop.mjs", { session_id: "s2", transcript_path: t2, hook_event_name: "Stop" }, dir2);
+    for (const s of readSpans(dir2)) {
+      expect(Object.keys(s).filter((k) => k.endsWith("_local")), `${s.kind} 不该有副本`).toEqual([]);
+    }
   });
 
-  it("keeps input_local out of the reported payload: local JSONL has it, sink does not", async () => {
+  it("root agent span 的 prompt 与结论超限同样落本地全量", () => {
+    const dir = tempObsDir();
+    const transcript = longTranscript(dir, { text: "x", args: { c: 1 }, result: "ok" });
+    seedState(dir, "s1", transcript, { prompt: "P".repeat(30) });
+    runHook(
+      "stop.mjs",
+      { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "C".repeat(30) },
+      dir,
+      { DBDOG_OBS_CONTENT_CHARS: "10" },
+    );
+    const root = readSpans(dir).find((s) => s.kind === "agent");
+    expect(root.input).toBe("P".repeat(10));
+    expect(root.input_local).toBe("P".repeat(30));
+    expect(root.output).toBe("C".repeat(10));
+    expect(root.output_local).toBe("C".repeat(30));
+  });
+
+  it("*_local 字段一律不上报：本地 JSONL 有，sink 没有", async () => {
     const dir = tempObsDir();
     const sink = await startSpanSink();
     try {
-      const transcript = writeTranscript(dir, "t.jsonl", [
-        { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
-        {
-          type: "assistant",
-          timestamp: T("05.000"),
-          requestId: "req_1",
-          message: { model: "m", usage: { input_tokens: 3, output_tokens: 50 }, content: [{ type: "text", text: "x" }] },
-        },
-      ]);
+      const transcript = longTranscript(dir, {
+        text: "A".repeat(30),
+        thinking: "T".repeat(30),
+        args: { command: "x".repeat(30) },
+        result: "R".repeat(30),
+      });
       seedState(dir, "s1", transcript);
       await runHookAsync(
         "stop.mjs",
         { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" },
         dir,
-        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "test-key" },
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "test-key", DBDOG_OBS_CONTENT_CHARS: "10" },
       );
-      expect(readSpans(dir).find((s) => s.kind === "llm").input_local).toBe("[user]\n诊断: 为什么卡住");
-      const reported = sink.received.find((s) => s.kind === "llm");
-      expect(reported).toBeDefined();
-      expect(reported.input_local).toBeUndefined();
+      const localKeys = readSpans(dir).flatMap((s) => Object.keys(s).filter((k) => k.endsWith("_local")));
+      expect(localKeys.sort()).toEqual(["input_local", "output_local", "output_local", "thinking_local"]);
+      expect(sink.received.length).toBeGreaterThan(0);
+      for (const s of sink.received) {
+        expect(Object.keys(s).filter((k) => k.endsWith("_local")), `${s.kind} 上报包不得带本地字段`).toEqual([]);
+      }
+      expect(sink.received.find((s) => s.kind === "llm").output).toBe("A".repeat(10));
     } finally {
       await sink.close();
     }
+  });
+
+  it("不再有 input_local 与上下文滚动缓冲（状态文件无 ctx_buf）", () => {
+    const dir = tempObsDir();
+    const transcript = longTranscript(dir, { text: "x", args: { c: 1 }, result: "ok" });
+    seedState(dir, "s1", transcript);
+    runHook("stop.mjs", { session_id: "s1", transcript_path: transcript, hook_event_name: "Stop" }, dir);
+    const llm = readSpans(dir).find((s) => s.kind === "llm");
+    expect(llm.input).toBeNull();
+    expect(llm.input_local).toBeUndefined();
+    expect(readState(dir, "s1").ctx_buf).toBeUndefined();
   });
 });
 
@@ -812,6 +828,34 @@ async function startSpanSink() {
   };
 }
 
+/** 先收 acceptBatches 批（202），之后一律 500——模拟慢链路上「前几批成功、后面超时」。 */
+async function startFlakySink(acceptBatches) {
+  const received = [];
+  let posts = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      posts++;
+      if (posts <= acceptBatches) {
+        try {
+          received.push(...(JSON.parse(body).spans ?? []));
+        } catch {
+          /* ignore */
+        }
+        res.writeHead(202, { "content-type": "application/json" });
+      } else res.writeHead(500);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`,
+    received,
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
 /**
  * 异步跑脚本——必须异步：sweep 会 POST 到本测试进程内起的 sink server，
  * 用 spawnSync 会阻塞 vitest 的事件循环，server 根本没机会响应，
@@ -994,6 +1038,76 @@ describe("sweep: 补发卡死的 pending", () => {
   });
 });
 
+describe("sweep: 分批落盘进度", () => {
+  it("前几批成功、后面失败：已送达的 id 立即从 pending 去掉，下次只重发剩下的", async () => {
+    // 2026-09-08 之前「一批失败就整体留着」：前面成功的批次下次原样重发，慢链路上每轮
+    // 都从头撞，永远收敛不了。现在每批成功就把进度写回状态文件。
+    const dir = tempObsDir();
+    const sink = await startFlakySink(1);
+    try {
+      const ids = ["s1", "s2", "s3", "s4"];
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        ids.map((id) => JSON.stringify({ trace_id: "t", span_id: id, kind: "llm", name: id })).join("\n") + "\n",
+      );
+      const p = writeStateFile(dir, "slow.json", { trace_id: "t", pending_spans: ids });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        DBDOG_OBS_SWEEP_BATCH: "2",
+      });
+
+      expect(sink.received.map((s) => s.span_id)).toEqual(["s1", "s2"]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["s3", "s4"]);
+      expect(fs.existsSync(p), "没排空不得删文件").toBe(true);
+    } finally {
+      await sink.close();
+    }
+  });
+});
+
+describe("spans.jsonl 流式扫描（不整文件读进内存）", () => {
+  // 实测本地 spans.jsonl 376MB：三处 readFileSync 全量读 + split 让 sweep 常驻 2GB、跑 57s；
+  // 再涨到 Node 字符串上限（约 5 亿字符）readFileSync 直接抛，hook 吞错后补发与总结静默失效。
+  it("scanSpans 逐行回调，容忍脏行与无换行收尾的末行", async () => {
+    const dir = tempObsDir();
+    const spansFile = path.join(dir, "spans.jsonl");
+    fs.writeFileSync(
+      spansFile,
+      [
+        JSON.stringify({ trace_id: "t", span_id: "a", kind: "llm" }),
+        "{not json",
+        "",
+        JSON.stringify({ trace_id: "t", span_id: "b", kind: "tool" }),
+        JSON.stringify({ trace_id: "t", span_id: "a", kind: "llm", name: "rewritten" }),
+      ].join("\n"), // 末行故意不带 \n
+    );
+    process.env.DBDOG_OBS_SPANS = spansFile;
+    try {
+      const seen = [];
+      await scanSpans((span) => seen.push(span));
+      expect(seen.map((s) => s.span_id)).toEqual(["a", "b", "a"]);
+      expect(seen[2].name).toBe("rewritten");
+    } finally {
+      delete process.env.DBDOG_OBS_SPANS;
+    }
+  });
+
+  it("文件不存在 → 一次都不回调、不抛", async () => {
+    process.env.DBDOG_OBS_SPANS = path.join(tempObsDir(), "missing.jsonl");
+    try {
+      let n = 0;
+      await scanSpans(() => n++);
+      expect(n).toBe(0);
+    } finally {
+      delete process.env.DBDOG_OBS_SPANS;
+    }
+  });
+});
+
 describe("sweep: 清理过期状态文件", () => {
   it("deletes drained files past their TTL and keeps the rest", async () => {
     const dir = tempObsDir();
@@ -1092,7 +1206,10 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
     for (const id of pending) expect(known.has(id)).toBe(true);
   });
 
-  it("re-sends spans carried over from a previous failed report", async () => {
+  it("Stop 不重发积压：旧 id 原样留在 pending，上报包只含本轮 span；积压由 sweep 补发", async () => {
+    // 2026-09-08：此前 Stop 把「全部积压 + 本轮新 span」一次发——积压越多包越大越发不成功，
+    // 慢链路上永远排不空（8 月 559 条从 08-12 卡到 09-08）。Stop 在 15s hook 超时的关键
+    // 路径上，只管本轮；积压交给不在交互路径上的 sweep 分批慢慢发。
     const dir = tempObsDir();
     const transcript = tinyTranscript(dir);
     seedState(dir, "p2", transcript);
@@ -1107,7 +1224,7 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
     const carried = readState(dir, "p2").pending_spans;
     expect(carried.length).toBeGreaterThan(0);
 
-    // 第二次：通了——上一轮攒下的 id 应被回捞成全文一起发出
+    // 第二次：通了——只发本轮新合成的 span（游标已推进，本轮只有 root 重发），积压原样保留
     const sink = await startSpanSink();
     try {
       await runHookAsync(
@@ -1116,11 +1233,46 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
         dir,
         { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k" },
       );
+      const root = readState(dir, "p2").root_span_id;
+      expect(sink.received.map((s) => s.span_id)).toEqual([root]);
+      const stillPending = readState(dir, "p2").pending_spans;
+      for (const id of carried) if (id !== root) expect(stillPending, `${id} 应仍在 pending`).toContain(id);
+
+      // 积压由 sweep 补发（状态文件闲置超过 idle 后）
+      const p = path.join(dir, "p2.json");
+      ageFile(p, 3 * HOUR);
+      await runScript("sweep.mjs", dir, { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k", DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR) });
       const sent = new Set(sink.received.map((s) => s.span_id));
-      for (const id of carried) expect(sent.has(id), `${id} 应被补发`).toBe(true);
-      // 补发的是全文，不是光秃秃的 id
-      expect(sink.received.every((s) => typeof s === "object" && s.kind)).toBe(true);
+      for (const id of carried) expect(sent.has(id), `${id} 应由 sweep 补发`).toBe(true);
       expect(readState(dir, "p2").pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("SessionEnd 同样只发本轮 span，积压留给随后触发的 sweep", async () => {
+    const dir = tempObsDir();
+    const transcript = tinyTranscript(dir);
+    seedState(dir, "p3", transcript, { pending_spans: ["stale1", "stale2"] });
+    fs.appendFileSync(
+      path.join(dir, "spans.jsonl"),
+      ["stale1", "stale2"].map((id) => JSON.stringify({ trace_id: "a".repeat(32), span_id: id, kind: "tool", name: "old" })).join("\n") + "\n",
+    );
+    const sink = await startSpanSink();
+    try {
+      await runHookAsync(
+        "session-end.mjs",
+        { session_id: "p3", transcript_path: transcript, hook_event_name: "SessionEnd", reason: "exit" },
+        dir,
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k", DBDOG_OBS_SWEEP_IDLE_MS: String(10 * DAY) },
+      );
+      const sent = sink.received.map((s) => s.span_id);
+      expect(sent).not.toContain("stale1");
+      expect(sent).not.toContain("stale2");
+      expect(sent.length).toBeGreaterThan(0);
+      const pending = readState(dir, "p3").pending_spans;
+      expect(pending).toContain("stale1");
+      expect(pending).toContain("stale2");
     } finally {
       await sink.close();
     }
@@ -2056,9 +2208,8 @@ describe("codex 复审阻断项", () => {
     expect(last.tokens_output).toBe(20); // usage 是全量重复,不是增量——只算一次
     expect(last.output).toContain("part1");
     expect(last.output).toContain("part2");
-    // 复审中危:续写行的 input_local 必须仍是"本次调用之前"的快照——part1 是本次调用
-    // 自己的输出,混进去就违反语义(续写沿用首批快照)
-    expect(last.input_local ?? "").not.toContain("part1");
+    // 2026-09-08:input_local 已移除(见「本地全量、上报截断」),续写行不得再带它
+    expect(last.input_local).toBeUndefined();
     // 复审高危:root 刷新要吃到整段结论(同 requestId 多行合并后的全量,不是只取末行)
     const root = readSpans(dir).filter((s) => s.span_id === st.root_span_id).pop();
     expect(root.output).toContain("part1");
