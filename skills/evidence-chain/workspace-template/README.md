@@ -1,72 +1,65 @@
-# 反向取证工作区(Windows,全自动)
+# 反向取证工作区(Windows)
 
 解压后目录:
 
 ```
 pair\
-├── run.cmd                ← 双击/计划任务入口:先自检,再按 batch.md 顺序跑全部用例;日志在 logs\
+├── run.cmd                ← 双击/计划任务入口:先自检,再按 batch.md 顺序跑全部单号;日志在 logs\
 ├── schedule.cmd           ← 注册成每天 02:00 的 Windows 计划任务(跑一次即可;删任务:schtasks /delete /tn evidence-chain-nightly /f)
 ├── install-skills.cmd     ← 可选:把 skills\ 下两个 skill 复制到 %USERPROFILE%\.claude\skills,在 Claude Code 会话里也能用「反向取证」「正向」触发
-├── batch.md               ← 唯一要改的配置:几行路径 + 阶段
+├── batch.md               ← 唯一要改的配置:复现文件 / 根因文件 / 源码树 / 输出目录
 ├── inputs\
-│   ├── tickets.txt        ← 问题单文件:一行一个单号,后面可跟修复代码链接、事故窗
-│   ├── reproduce.md       ← 多用例复现文件(现象 + 复现时间),每个用例一个「## 单号」小节
-│   ├── filter.md          ← 多用例根因文件,每个用例一个「## 单号」小节;这里没有的单号跳过
+│   ├── reproduce.md       ← 多用例复现文件:单号、复现开始/结束时间、现象都从这里拿,每个单号一个「## 单号」小节
+│   ├── filter.md          ← 多用例根因文件:按单号找根因;小节里写了修复代码链接也会被认出来;这里没有的单号跳过
 │   └── fixes\             ← 有本地 diff 就放这
-├── mcp.json               ← dbdog MCP 配置(从 mcp.example.json 改;诊断和反向都用它)
+├── mcp.json               ← dbdog MCP 配置(从 mcp.example.json 改)
 ├── skills\
 │   ├── evidence-chain\    ← 反向取证 skill(batch.py 在 scripts\ 下)
-│   └── span-graph\        ← span 转假设图 skill
-└── out\                   ← 产物,一个用例一个目录(见下)
+│   └── span-graph\        ← span 转假设图 skill(单独跑,产物放进同一个单号目录)
+└── out\                   ← 输出父目录,下面按单号建子目录(见下)
 ```
 
 ## 上手
 
-1. 装好 Python 3.8+ 和 Claude Code CLI(`python`、`claude` 在 PATH)。
-2. Claude Code 里装好 dbdog-obs hook(插件 `dbdog-agent-obs`),并在 `settings.json` 的 env 里配 `DBDOG_OBS_REPORT_URL` / `DBDOG_OBS_API_KEY`。没有 hook 就没有 span,正向图会是空的。
-3. 把问题单文件、复现文件、根因文件放进 `inputs\`;改 `batch.md` 里的源码树路径;`mcp.example.json` 改成 `mcp.json` 填上地址和鉴权。
-4. 跑 `run.cmd`。它先自检(Python、claude、MCP 连通、源码树、每个用例能否切到、复现时间抓到什么),红的按提示修;通过就顺序跑。
-5. 看 `out\batch-summary.md`。
+1. 装好 Python 3.8+ 和 Claude Code CLI(`python`、`claude` 在 PATH),Claude Code 里 dbdog MCP 能用。
+2. 把复现文件、根因文件放进 `inputs\`;改 `batch.md` 里的源码树路径;`mcp.example.json` 改成 `mcp.json` 填上地址和鉴权(不填就继承 claude 自己配的 MCP)。
+3. 跑 `run.cmd`。它先自检(Python、claude、MCP 连通、文件、每个单号能否切到、抓到的事故窗和修复链接),红的按提示修;通过就顺序跑。
+4. 看 `out\batch-summary.md`。
 
-跑完想挂成每晚自动:跑一次 `schedule.cmd`。幂等:已跑完的用例跳过,batch.md 新加的用例(或 inputs 里新加的小节)下次自动被捡起来。
+跑完想挂成每晚自动:跑一次 `schedule.cmd`。幂等:已跑完的单号跳过,复现文件里新加的小节下次自动被捡起来。
 
-## 每个用例目录里有什么
+## 每个单号目录里有什么
 
 ```
 out\<单号>\
-├── prompt.txt / root-cause.md / window.txt   切分出来的题面、根因、事故窗
-├── spans.jsonl                                诊断阶段:hook 落的 span
-├── work-diag\                                 诊断会话的题面、权限、stdout、err
-├── forward-path.md (+ .json)                  正向阶段:假设图
-├── evidence-chain.md (+ .json)                反向阶段:五段式 + 讲不讲得通 + dbdog 侧发现
-└── work\                                      反向推导角的工作目录(claude.err / case.md / ticket.txt / fix.diff)
+├── prompt.txt / root-cause.md / window.txt   切分出来的现象、根因、事故窗
+├── evidence-chain.md (+ .json)               五段式 + 讲不讲得通 + dbdog 侧发现
+└── work\                                     推导角工作目录(claude.err / case.md / ticket.txt / fix.diff)
 ```
 
-之后做「对比」时,把 forward\forward-path.md 和 reverse\evidence-chain.md 一起交给强模型,结果放 compare\。
+正向假设图用 span-graph 单独出,把 `forward-path.md` 放进同一个单号目录;之后做「对比」时两份 md 就在一起。
 
-## 三个输入文件的格式
+## 两个输入文件的格式
 
-`tickets.txt` 一行一个单号,后面可跟修复代码链接(commit / PR / 本地 diff)和事故窗,空格或 | 分开,都可省:
-
-```
-DTS2026090100123  https://codehub.example.com/r/commit/abc123  2026-09-09 09:04:00 ~ 2026-09-09 09:07:00
-DTS2026090100456  https://gitee.com/opengauss/openGauss-server/pulls/8080
-```
-
-复现文件、根因文件按单号切小节,标题行含单号即可:
+按单号切小节,标题行含单号即可。复现文件的小节里放复现开始/结束时间(或一行「复现时间: A ~ B」)和现象;根因文件的小节里放根因,有修复代码链接就写上:
 
 ```markdown
 ## DTS2026090100123 慢查询
-复现时间: 2026-09-09 09:04:00 ~ 2026-09-09 09:07:00
+复现开始时间: 2026-09-09 09:04:00
+复现结束时间: 2026-09-09 09:07:00
 现象: openGauss 业务库 bench 里一条对 t0、t1 的查询很慢……
-复现步骤: ……
 ```
 
-复现时间那行带「复现时间 / 执行时间 / 时间窗」等字样,或一行里有两个时间戳,都能抓到;`run.cmd` 自检会逐用例打印抓到的时间,先核一眼。
+```markdown
+## DTS2026090100123
+根因: ……
+修复: https://codehub.example.com/r/openGauss/commit/abc123
+```
+
+`run.cmd` 自检会逐单号打印抓到的事故窗和修复链接,先核一眼。
 
 ## 出了问题看哪
 
 - 自检不过:按红字提示;MCP 连不上先在 Claude Code 里确认 dbdog 工具能用。
-- 某用例反向失败:`out\<单号>\reverse\work\claude.err`;诊断失败:`out\<单号>\forward\diag\diag.err`。
-- 正向图全是「未挂到假设」:诊断题面没带假设书写约定,或 hook 没装;批次自动跑的诊断会自动带。
+- 某单号失败:`out\<单号>\work\claude.err`。
 - 整批日志:`logs\run-<日期时间>.log`。

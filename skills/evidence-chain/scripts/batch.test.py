@@ -6,205 +6,115 @@ import unittest
 
 import batch as b
 
-MANIFEST = """# 反向推导批次
-
-- 现象文件: {d}/reproduce.md
-- 根因文件: {d}/filter.md
-- 源码树: {d}/src
-- 输出目录: {d}/out
-- 间隔分钟: 0
-
-| 用例 | 事故窗 | 修复 | 备注 |
-|---|---|---|---|
-| DTS001 | 2026-09-09 09:04–09:07 (UTC+8),库 bench | https://dts.example.com/issue/001 | |
-| DTS002 | 2026-09-09 10:12–10:15 (UTC+8) | {d}/fix2.diff | 有 diff |
-| DTS003 | 2026-09-09 11:00–11:03 (UTC+8) | | 没根因 |
-"""
-
 REPRO = """# 复现用例集
 
-## DTS001 OR-EXISTS 慢查询
-诊断: 09:04–09:07 bench 库有条涉及 t0、t1 的查询很慢
+## DTS2026090100123 OR-EXISTS 慢查询
+复现开始时间: 2026-09-09 09:04:00
+复现结束时间: 2026-09-09 09:07:00
+现象: openGauss 业务库 bench 有一条涉及 t0、t1 的查询很慢
 ### 复现步骤
 create table ...
 
-## DTS002 锁等待
-诊断: 10:12 起大量会话卡住
+## DTS2026090100456 锁等待
+复现时间: 2026-09-09 10:12 ~ 10:15
+现象: 大量会话卡住
+修复: https://codehub.example.com/r/openGauss/commit/deadbeef
 
-## DTS003 别的
-诊断: 内存涨
+## DTS2026090100789 别的
+在 2026-09-09 11:00 到 11:03 之间内存涨
 """
 
 FILTER = """# 根因集
 
-## DTS002
+## DTS2026090100456
 ### 根因
 autovacuum 与 DDL 互锁
 
-## DTS001
+## DTS2026090100123
 ### 根因
 sublink pull-up 未做代价判断
+修复 PR: https://gitee.com/opengauss/openGauss-server/pulls/8080
 ### 现象量化
 - fast 0.514 ms / slow 860 ms
 """
 
 
-class Manifest(unittest.TestCase):
-    def test_parse(self):
-        m = b.parse_manifest(MANIFEST.format(d="/x"))
-        self.assertEqual(m["settings"]["phenomenon_file"], "/x/reproduce.md")
-        self.assertEqual(m["settings"]["root_cause_file"], "/x/filter.md")
-        self.assertEqual(m["settings"]["source"], "/x/src")
-        self.assertEqual(m["settings"]["out"], "/x/out")
-        self.assertEqual(m["settings"]["interval_min"], 0.0)
-        self.assertEqual([c["id"] for c in m["cases"]], ["DTS001", "DTS002", "DTS003"])
-        self.assertEqual(m["cases"][0]["fix"], "https://dts.example.com/issue/001")
-        self.assertEqual(m["cases"][2]["fix"], "")
-        self.assertIn("库 bench", m["cases"][0]["window"])
+def ws(d, manifest_extra=""):
+    open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
+    open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
+    os.makedirs(os.path.join(d, "src"), exist_ok=True)
+    mp = os.path.join(d, "batch.md")
+    open(mp, "w", encoding="utf-8").write("- 复现文件: reproduce.md\n- 根因文件: filter.md\n- 源码树: src\n- 输出目录: out\n- 间隔分钟: 0\n" + manifest_extra)
+    return mp
 
-    def test_extract_by_heading(self):
-        ids = ["DTS001", "DTS002", "DTS003"]
-        s = b.extract_section(REPRO, "DTS001", ids)
-        self.assertIn("t0、t1", s); self.assertIn("复现步骤", s); self.assertNotIn("锁等待", s)
-        s2 = b.extract_section(FILTER, "DTS001", ids)
-        self.assertIn("pull-up", s2); self.assertIn("现象量化", s2); self.assertNotIn("autovacuum", s2)
-        self.assertIsNone(b.extract_section(FILTER, "DTS003", ids))
 
-    def test_extract_fallback_plain_lines(self):
-        text = "DTS001: 现象 A\n细节 a\nDTS002: 现象 B\n细节 b\n"
-        self.assertEqual(b.extract_section(text, "DTS001", ["DTS001", "DTS002"]).strip(), "DTS001: 现象 A\n细节 a")
-        self.assertEqual(b.extract_section(text, "DTS002", ["DTS001", "DTS002"]).strip(), "DTS002: 现象 B\n细节 b")
+class Batch(unittest.TestCase):
+    def test_manifest(self):
+        st = b.parse_manifest("# 批次\n- 复现文件: a.md\n- 根因文件: b.md\n- 源码树: /s\n- 输出目录: /o\n")["settings"]
+        self.assertEqual(st["phenomenon_file"], "a.md"); self.assertEqual(st["out"], "/o"); self.assertEqual(st["interval_min"], 5.0)
 
-    def test_fix_kind(self):
-        self.assertEqual(b.fix_kind("https://github.com/o/r/pull/1"), "diff_url")
-        self.assertEqual(b.fix_kind("https://gitee.com/o/r/pulls/1"), "diff_url")
-        self.assertEqual(b.fix_kind("https://dts.example.com/issue/1"), "ticket")
-        self.assertEqual(b.fix_kind("/x/fix.diff"), "file")
-        self.assertEqual(b.fix_kind(""), "none")
-
-    def test_dry_run_prepares_inputs_and_summary(self):
-        with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
-            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
-            open(os.path.join(d, "fix2.diff"), "w", encoding="utf-8").write("--- a\n+++ b\n")
-            os.makedirs(os.path.join(d, "src"))
-            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d))
-            rows = b.run_batch(mp, dry_run=True)
-            st = {r["id"]: r["status"] for r in rows}
-            self.assertEqual(st, {"DTS001": "dry_run", "DTS002": "dry_run", "DTS003": "skipped_no_root_cause"})
-            c1 = os.path.join(d, "out", "DTS001")
-            self.assertIn("t0、t1", open(os.path.join(c1, "prompt.txt"), encoding="utf-8").read())
-            self.assertIn("pull-up", open(os.path.join(c1, "root-cause.md"), encoding="utf-8").read())
-            self.assertIn("09:04", open(os.path.join(c1, "window.txt"), encoding="utf-8").read())
-            self.assertTrue(os.path.isfile(os.path.join(d, "out", "batch-summary.md")))
-            summ = open(os.path.join(d, "out", "batch-summary.md"), encoding="utf-8").read()
-            self.assertIn("DTS003", summ); self.assertIn("根因", summ)
-            import json
-            js = json.load(open(os.path.join(d, "out", "batch-summary.json"), encoding="utf-8"))
-            self.assertEqual([c["id"] for c in js["cases"]], ["DTS001", "DTS002", "DTS003"])
-            dr = open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read()
-            self.assertIn(os.path.join("DTS001", "reverse", "work"), dr); self.assertIn("--out " + os.path.join(c1, "reverse"), dr)
-
-    def test_diag_prompt_and_env(self):
-        pr = b.build_diag_prompt("## OG-1 复现用例\n\n诊断: {{WINDOW}}(UTC+8),bench 库慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "【假设书写约定】...")
-        self.assertTrue(pr.startswith("诊断: 2026-09-09 09:04–09:07(UTC+8),bench 库慢"), pr[:80])
-        self.assertNotIn("复现用例", pr)
-        pr2 = b.build_diag_prompt("题面 {{WINDOW}} 慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "R")
-        self.assertTrue(pr2.startswith("诊断: 题面 2026-09-09 09:04–09:07 (UTC+8) 慢"))
-        self.assertIn("【假设书写约定】", pr)
-        self.assertTrue(b.build_diag_prompt("bench 库慢", "", "R").startswith("诊断: bench 库慢"))
-        env = b.diag_env({"PATH": "/bin"}, "/out/OG-1", "OG-1", "/cfg")
-        self.assertEqual(env["DBDOG_OBS_SPANS"], os.path.join("/out/OG-1", "forward", "spans.jsonl"))
-        self.assertEqual(env["DBDOG_OBS_DIR"], os.path.join("/out/OG-1", "forward", "obs-state"))
-        self.assertEqual(env["DBDOG_OBS_TAGS"], "case_id=OG-1")
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg")
-        deny = b.diag_settings("/out")["permissions"]["deny"]
-        self.assertIn("Read(///out/**)", deny)
-        self.assertFalse(any(x.startswith(("Grep(", "Glob(")) for x in deny))
-
-    def test_stage_plan(self):
-        with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
-            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
-            open(os.path.join(d, "fix2.diff"), "w", encoding="utf-8").write("--- a\n+++ b\n")
-            os.makedirs(os.path.join(d, "src"))
-            os.makedirs(os.path.join(d, "out", "DTS002", "forward")); open(os.path.join(d, "out", "DTS002", "forward", "spans.jsonl"), "w").write("{}\n")
-            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d).replace("- 间隔分钟: 0", "- 间隔分钟: 0\n- 阶段: 诊断,正向,反向"))
-            rows = {r["id"]: r for r in b.run_batch(mp, dry_run=True)}
-            self.assertEqual(rows["DTS001"]["stages"], ["诊断", "正向", "反向"])
-            self.assertEqual(rows["DTS002"]["stages"], ["正向", "反向"])   # 已有 spans.jsonl,不再诊断
-            os.makedirs(os.path.join(d, "out", "DTS002", "reverse")); open(os.path.join(d, "out", "DTS002", "reverse", "evidence-chain.md"), "w").write("x")
-            rows = {r["id"]: r for r in b.run_batch(mp, dry_run=True)}
-            self.assertEqual(rows["DTS002"]["stages"], ["正向"])   # 反向产物也在了,只剩正向(零模型,总是重出)
-
-    def test_discover_ids_and_window(self):
-        rc = "# 根因集\n\n## DTS2026090100123 慢\n根因 A\n\n## DTS2026090100456\n根因 B\n\n## OG-7601\n根因 C\n"
-        self.assertEqual(b.discover_ids(rc), ["DTS2026090100123", "DTS2026090100456", "OG-7601"])
-        self.assertEqual(b.discover_ids(rc, r"DTS\d+"), ["DTS2026090100123", "DTS2026090100456"])
-        self.assertEqual(b.extract_window("## X\n现象:慢\n复现时间:2026-09-09 09:04:00 ~ 2026-09-09 09:07:00\n步骤..."), "2026-09-09 09:04:00 ~ 2026-09-09 09:07:00")
+    def test_window(self):
+        self.assertEqual(b.extract_window("复现开始时间: 2026-09-09 09:04:00\n复现结束时间: 2026-09-09 09:07:00\n"), "2026-09-09 09:04:00 ~ 2026-09-09 09:07:00")
+        self.assertEqual(b.extract_window("- 开始时间:2026/09/09 09:04\n- 结束时间:2026/09/09 09:07"), "2026/09/09 09:04 ~ 2026/09/09 09:07")
+        self.assertEqual(b.extract_window("复现时间:2026-09-09 09:04:00 ~ 2026-09-09 09:07:00"), "2026-09-09 09:04:00 ~ 2026-09-09 09:07:00")
         self.assertEqual(b.extract_window("- 执行时间窗: 2026/09/09 09:04–09:07 (UTC+8)"), "2026/09/09 09:04–09:07 (UTC+8)")
-        self.assertEqual(b.extract_window("| 时间 | 2026-09-09 09:04 |\n"), "2026-09-09 09:04")
         self.assertEqual(b.extract_window("在 2026-09-09 09:04 到 09:07 之间变慢"), "在 2026-09-09 09:04 到 09:07 之间变慢")
-        self.assertEqual(b.extract_window("没有时间的现象"), "")
+        self.assertEqual(b.extract_window("没有时间"), "")
 
-    def test_no_table_uses_root_cause_ids_and_ticket_template(self):
+    def test_fix_link(self):
+        self.assertEqual(b.extract_fix("根因……\n修复 PR: https://gitee.com/o/r/pulls/8080\n"), "https://gitee.com/o/r/pulls/8080")
+        self.assertEqual(b.extract_fix("见 https://codehub.example.com/r/x/commit/deadbeef)。"), "https://codehub.example.com/r/x/commit/deadbeef")
+        self.assertEqual(b.extract_fix("补丁链接:https://dts.example.com/issue/1"), "https://dts.example.com/issue/1")
+        self.assertEqual(b.extract_fix("无"), "")
+
+    def test_assemble_from_reproduce(self):
         with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(
-                "# 复现\n\n## DTS001 慢查询\n复现时间:2026-09-09 09:04 ~ 09:07\n诊断: bench 库 t0 t1 慢\n\n## DTS002 锁\n复现时间:2026-09-09 10:00 ~ 10:03\n诊断: 卡住\n")
-            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write("# 根因\n\n## DTS002\n锁\n\n## DTS001\n提升\n")
-            os.makedirs(os.path.join(d, "src"))
-            mp = os.path.join(d, "batch.md")
-            open(mp, "w", encoding="utf-8").write(f"- 现象文件: reproduce.md\n- 根因文件: filter.md\n- 源码树: src\n- 输出目录: out\n- 间隔分钟: 0\n- 问题单地址模板: https://dts.example.com/issue/{{id}}\n- 用例号正则: DTS\\d+\n")
+            mp = ws(d)
+            st = b.parse_manifest(open(mp, encoding="utf-8").read())["settings"]
+            absp = lambda p: os.path.join(d, p)
+            cases = {c["id"]: c for c in b.assemble(st, absp)}
+            self.assertEqual(list(cases), ["DTS2026090100123", "DTS2026090100456", "DTS2026090100789"])
+            c1 = cases["DTS2026090100123"]
+            self.assertEqual(c1["window"], "2026-09-09 09:04:00 ~ 2026-09-09 09:07:00")
+            self.assertEqual(c1["fix"], "https://gitee.com/opengauss/openGauss-server/pulls/8080")   # 根因小节里的链接
+            self.assertIn("t0、t1", c1["phenomenon"]); self.assertIn("pull-up", c1["root_cause"]); self.assertNotIn("autovacuum", c1["root_cause"])
+            c2 = cases["DTS2026090100456"]
+            self.assertEqual(c2["window"], "2026-09-09 10:12 ~ 10:15"); self.assertEqual(c2["fix"], "https://codehub.example.com/r/openGauss/commit/deadbeef")
+            self.assertIsNone(cases["DTS2026090100789"]["root_cause"])
+
+    def test_check_and_dry_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = ws(d)
             problems, notes = b.check(mp)
             self.assertEqual(problems, [], problems)
-            self.assertTrue(any("发现 2 个用例:DTS002, DTS001" in n for n in notes), notes)
-            rows = b.run_batch(mp, dry_run=True)
-            self.assertEqual([r["id"] for r in rows], ["DTS002", "DTS001"])
-            dr = open(os.path.join(d, "out", "DTS001", "dry-run.txt"), encoding="utf-8").read()
-            self.assertIn("--fix https://dts.example.com/issue/DTS001", dr)
-            self.assertIn("--window 2026-09-09 09:04 ~ 09:07", dr)
-            self.assertNotIn("复现时间", open(os.path.join(d, "out", "DTS001", "prompt.txt"), encoding="utf-8").read().split("诊断:")[0][:0])
+            self.assertTrue(any("发现 3 个单号" in n for n in notes), notes)
+            self.assertTrue(any("DTS2026090100789:根因文件里没有" in n for n in notes))
+            rows = {r["id"]: r["status"] for r in b.run_batch(mp, dry_run=True)}
+            self.assertEqual(rows, {"DTS2026090100123": "dry_run", "DTS2026090100456": "dry_run", "DTS2026090100789": "skipped_no_root_cause"})
+            c1 = os.path.join(d, "out", "DTS2026090100123")
+            for f in ("prompt.txt", "root-cause.md", "window.txt", "dry-run.txt"):
+                self.assertTrue(os.path.isfile(os.path.join(c1, f)), f)
+            dr = open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read()
+            self.assertIn("--out " + c1, dr); self.assertIn("--work " + os.path.join(c1, "work"), dr)
+            self.assertIn("--fix https://gitee.com", dr); self.assertIn("--window 2026-09-09 09:04:00 ~", dr)
+            summ = open(os.path.join(d, "out", "batch-summary.md"), encoding="utf-8").read()
+            self.assertIn("DTS2026090100789 | 跳过:根因文件里没有该单号", summ)
+            self.assertTrue(os.path.isfile(os.path.join(d, "out", "batch-summary.json")))
 
-    def test_tickets_file(self):
-        txt = ("# 单号  修复链接  事故窗\n"
-               "DTS2026090100123 https://codehub.example.com/r/commit/abc123 2026-09-09 09:04–09:07 (UTC+8)\n"
-               "DTS2026090100456\thttps://gitee.com/o/r/pulls/9\n"
-               "DTS2026090100789 | D:\\fixes\\789.diff | 2026-09-09 11:00–11:03 |\n"
-               "| 单号 | 修复 |\n|---|---|\n| DTS2026090100999 | |\n"
-               "OG-7601\n")
-        t = b.parse_tickets(txt)
-        self.assertEqual([c["id"] for c in t], ["DTS2026090100123", "DTS2026090100456", "DTS2026090100789", "DTS2026090100999", "OG-7601"])
-        self.assertEqual(t[0]["fix"], "https://codehub.example.com/r/commit/abc123"); self.assertEqual(t[0]["window"], "2026-09-09 09:04–09:07 (UTC+8)")
-        self.assertEqual(t[1]["fix"], "https://gitee.com/o/r/pulls/9"); self.assertEqual(t[1]["window"], "")
-        self.assertEqual(t[2]["fix"], "D:\\fixes\\789.diff"); self.assertEqual(t[2]["window"], "2026-09-09 11:00–11:03")
-        self.assertEqual(t[4]["fix"], "")
+    def test_tickets_file_limits_and_overrides(self):
         with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write("## DTS001\n复现时间: 2026-09-09 09:04 ~ 09:07\n诊断: 慢\n\n## DTS002\n诊断: 卡\n")
-            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write("## DTS001\n提升\n\n## DTS002\n锁\n")
-            open(os.path.join(d, "tickets.txt"), "w", encoding="utf-8").write("DTS001 https://x/commit/1\nDTS002 https://x/commit/2 2026-09-09 10:00–10:03\n")
-            os.makedirs(os.path.join(d, "src"))
-            mp = os.path.join(d, "batch.md")
-            open(mp, "w", encoding="utf-8").write("- 问题单文件: tickets.txt\n- 现象文件: reproduce.md\n- 根因文件: filter.md\n- 源码树: src\n- 输出目录: out\n- 间隔分钟: 0\n")
-            problems, notes = b.check(mp)
-            self.assertEqual(problems, [], problems)
-            rows = b.run_batch(mp, dry_run=True)
-            self.assertEqual([r["id"] for r in rows], ["DTS001", "DTS002"])
-            d1 = open(os.path.join(d, "out", "DTS001", "dry-run.txt"), encoding="utf-8").read()
-            self.assertIn("--fix https://x/commit/1", d1); self.assertIn("--window 2026-09-09 09:04 ~ 09:07", d1)
-            d2 = open(os.path.join(d, "out", "DTS002", "dry-run.txt"), encoding="utf-8").read()
-            self.assertIn("--window 2026-09-09 10:00–10:03", d2)
+            open(os.path.join(d, "tickets.txt"), "w", encoding="utf-8").write("DTS2026090100456 D:\\fixes\\456.diff 2026-09-09 10:00–10:03\n")
+            mp = ws(d, "- 问题单文件: tickets.txt\n")
+            st = b.parse_manifest(open(mp, encoding="utf-8").read())["settings"]
+            cases = b.assemble(st, lambda p: os.path.join(d, p))
+            self.assertEqual([c["id"] for c in cases], ["DTS2026090100456"])
+            self.assertEqual(cases[0]["fix"], "D:\\fixes\\456.diff"); self.assertEqual(cases[0]["window"], "2026-09-09 10:00–10:03")
 
-    def test_check(self):
+    def test_missing_files(self):
         with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
-            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
-            os.makedirs(os.path.join(d, "src"))
-            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d))
-            problems, notes = b.check(mp)
-            joined = "\n".join(problems)
-            self.assertIn("DTS002:修复 diff 文件不存在", joined)   # fix2.diff 没建
-            self.assertNotIn("DTS001", joined)
-            self.assertTrue(any("DTS003:根因文件里没有" in n for n in notes))
+            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write("- 复现文件: nope.md\n- 根因文件: nope2.md\n")
+            problems, _ = b.check(mp)
+            self.assertTrue(any("复现文件不存在" in p for p in problems)); self.assertTrue(any("缺「输出目录」" in p for p in problems))
 
 
 if __name__ == "__main__":

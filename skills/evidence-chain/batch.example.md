@@ -1,27 +1,28 @@
 # 反向取证批次(示例,复制后改路径;Windows 路径直接写反斜杠即可)
 
-- 问题单文件: D:\pair\inputs\tickets.txt      ← 一行一个单号,后面可跟修复代码链接和事故窗(见下)
-- 现象文件: D:\pair\inputs\reproduce.md       ← 多用例复现文件,按单号找小节;小节里带复现时间的行会被解析成事故窗
-- 根因文件: D:\pair\inputs\filter.md          ← 多用例根因文件,按单号找小节;没有的单号跳过
+- 复现文件: D:\pair\inputs\reproduce.md   ← 单号、复现开始/结束时间、现象都从这里拿(每个单号一个「## 单号」小节)
+- 根因文件: D:\pair\inputs\filter.md      ← 按单号找根因;小节里写了修复代码链接(commit / PR / diff)也会被认出来
 - 源码树: D:\repo\opengauss-server
-- 输出目录: D:\pair\out
-- 阶段: 正向,反向                               ← 写 诊断,正向,反向 则连正向诊断一起自动跑
+- 输出目录: D:\pair\out                   ← 下面按单号建子目录
 - 间隔分钟: 5
-- MCP配置:                                     ← 可选,不给就继承 claude 配置目录里已配的 dbdog MCP
-- 模型档:                                       ← 可选,CLAUDE_CONFIG_DIR
+- MCP配置:                                ← 可选,不给就继承 claude 配置目录里已配的 dbdog MCP
+- 模型档:                                  ← 可选,CLAUDE_CONFIG_DIR
+- 问题单文件:                              ← 可选,一行一个单号(+ 修复链接 + 事故窗),用来限定/覆盖复现文件里发现的单号
+- 用例号正则:                              ← 可选,缺省认 DTS 单号 / OG-数字 / 大写字母-数字
 
-tickets.txt 的样子(链接、事故窗都可省;事故窗省了就从复现小节解析):
+复现文件小节长这样(标题含单号;开始/结束时间两行,或一行「复现时间: A ~ B」):
 
+```markdown
+## DTS2026090100123 OR-EXISTS 慢查询
+复现开始时间: 2026-09-09 09:04:00
+复现结束时间: 2026-09-09 09:07:00
+现象: openGauss 业务库 bench 有一条涉及 t0、t1 的查询很慢……
 ```
-# 单号  修复代码链接(commit / PR / 本地 diff)  事故窗
-DTS2026090100123  https://codehub.example.com/r/commit/abc123  2026-09-09 09:04–09:07 (UTC+8)
-DTS2026090100456  https://gitee.com/opengauss/openGauss-server/pulls/8080
-DTS2026090100789  D:\pair\inputs\fixes\789.diff
-DTS2026090100999
+
+根因文件小节(修复链接写在里面就会被拿去取 diff):
+
+```markdown
+## DTS2026090100123
+根因: sublink pull-up 未做代价判断……
+修复: https://codehub.example.com/r/openGauss/commit/abc123
 ```
-
-不想维护 tickets.txt 也行:去掉「问题单文件」那行,就跑根因文件里出现的全部单号(可用「用例号正则」限定),修复来源可用「问题单地址模板: https://…/{id}」拼出问题单网页去找(页面要登录就别指望它)。
-要覆盖某个单号的窗 / 修复 / 指定已有 span 文件,再在下面列一行:
-
-| 用例 | 事故窗 | 修复 | span 文件 | 备注 |
-|---|---|---|---|---|

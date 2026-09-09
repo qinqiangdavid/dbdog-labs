@@ -16,5 +16,5 @@ python "%BATCH%" "%WS%batch.md" %* >> "%LOG%" 2>&1
 set RC=%errorlevel%
 echo [%date% %time%] 结束 rc=%RC% >> "%LOG%"
 type "%WS%out\batch-summary.md" 2>nul
-if %RC% neq 0 echo 有用例失败,看 %LOG% 和 out\^<单号^>\reverse\work\claude.err
+if %RC% neq 0 echo 有用例失败,看 %LOG% 和 out\^<单号^>\work\claude.err
 endlocal & exit /b %RC%

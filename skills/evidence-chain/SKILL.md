@@ -57,75 +57,47 @@ python S/run.py 题目目录 --source 源码树目录      # 目录里有 prompt
 
 How do we know 的顺序是「先想要什么证据,再想用什么取,再真取」,工具目录只约束命名,不约束该不该列。之后与正向图对比时,前三类结论(无工具 / 应有结果但没有 / 结果不对)只看 How do we know 和附录就能定,与 agent 无关;「假设提错」「工具调错」由对比的模型拿正向图对着 Why 和 How do we know 判。
 
-## 工作区目录结构(同事照这个摆,流水线各阶段靠用例目录衔接)
+## 工作区目录结构(同事照这个摆)
 
 ```
 D:\pair\                       ← 工作区(各自一份或共享盘)
-├── batch.md                   ← 批次文件:全局设置 + 用例表,唯一要手写的东西(模板 batch.example.md)
+├── batch.md                   ← 唯一要手写的配置:复现文件 / 根因文件 / 源码树 / 输出目录(模板 batch.example.md)
 ├── inputs\
-│   ├── reproduce.md           ← 多用例现象文件
-│   ├── filter.md              ← 多用例根因文件
-│   └── fixes\                 ← 本地 diff 放这;DTS 单、PR 直接写链接
+│   ├── reproduce.md           ← 多用例复现文件:单号、复现开始/结束时间、现象都从这里拿(每个单号一个「## 单号」小节)
+│   ├── filter.md              ← 多用例根因文件:按单号找根因;小节里写了修复代码链接也会被认出来
+│   ├── tickets.txt            ← 可选:一行一个单号(+ 修复链接 + 事故窗),用来限定/覆盖复现文件里发现的单号
+│   └── fixes\                 ← 本地 diff 放这
 ├── mcp.json                   ← dbdog MCP 配置(可选,不给就继承 claude 自己的)
-└── out\                       ← 输出,一个用例一个子目录 = 各阶段的契约
-    ├── batch-summary.md       ← 给人看
-    ├── batch-summary.json     ← 给调度/程序看
-    └── <用例号>\
-        ├── prompt.txt / root-cause.md / window.txt   阶段 0 切分
-        ├── forward\                                  正向:spans.jsonl · obs-state\ · diag\(诊断阶段)→ forward-path.md
-        ├── reverse\                                  反向:evidence-chain.md (+ .json) · work\(推导角日志)
-        └── compare\                                  阶段 3 对比(以后接在同一目录上)
+└── out\                       ← 输出父目录,下面按单号建子目录
+    ├── batch-summary.md / .json
+    └── <单号>\
+        ├── prompt.txt / root-cause.md / window.txt   切分出来的现象、根因、事故窗
+        ├── evidence-chain.md (+ .json)               反向产物
+        └── work\                                     推导角工作目录(claude.err / case.md / ticket.txt / fix.diff)
 ```
 
-skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-graph\`(插件或 zip),工作区只放数据和产物。
+skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\`(插件或 zip),工作区只放数据和产物。本 skill 只做反向;正向假设图由 span-graph 单独跑,把 `forward-path.md` 放进同一个单号目录即可,对比时两份 md 就在一起。
 
-**同事上手三步**:① 复制 `batch.example.md` 成 `batch.md`,改路径、填用例表;② 跑 `run-batch.cmd batch.md`(mac/Linux 用 `run-batch.sh`),它先自检——Python、`claude`、MCP 连通、源码树、每个用例能不能在两个大文件里切到——红的按提示修;③ 看 `out\batch-summary.md`。
+**同事上手三步**:① 复制 `batch.example.md` 成 `batch.md`,改四个路径;② 跑 `run-batch.cmd batch.md`(mac/Linux 用 `run-batch.sh`),它先自检——Python、`claude`、MCP 连通、文件在不在、每个单号能否切到、抓到的事故窗和修复链接——红的按提示修;③ 看 `out\batch-summary.md`。幂等:已有产物的单号跳过,新加的单号下次自动被捡起来;有单号失败退出码为 1,可挂 Windows 计划任务 / cron。
 
-**流水线四段,`batch.py` 按 batch.md 里的「阶段」逐用例跑**:
+## 批量:一次给全量单号,顺序跑
 
-| 阶段 | 做什么 | 产物 | 跳过条件 |
-|---|---|---|---|
-| 切分 | 按用例号从两个大文件切出题面/根因,写事故窗 | prompt.txt / root-cause.md / window.txt | 总是重切 |
-| 诊断(可选) | 起一个带 hook + dbdog MCP 的正向诊断会话,题面拼上假设书写约定,`DBDOG_OBS_SPANS` 指到用例目录,对答案目录禁读 | forward/spans.jsonl(+ forward/diag/ 日志) | 已有 spans.jsonl |
-| 正向 | span-graph 零模型出图 | forward/forward-path.md | 无 spans.jsonl |
-| 反向 | 本 skill 的推导角真取证 | reverse/evidence-chain.md(+ reverse/work/ 日志) | 已有 evidence-chain.md |
-| 对比 | 以后接在同一目录上 | compare.md | — |
+写一份 `batch.md`(模板见 `batch.example.md`),四行必填:复现文件、根因文件、源码树、输出目录;可选:间隔分钟(缺省 5)、MCP配置、模型档、模型、问题单文件、用例号正则。runner 自己组装每个单号:
 
-「阶段」缺省 `正向,反向`(诊断由人另跑,见下);写 `诊断,正向,反向` 就全自动。幂等,重跑只补缺的阶段,有用例失败退出码为 1,可直接挂 Windows 计划任务 / cron 每晚跑,batch.md 新加的行自动被捡起来。诊断和反向都是 `claude -p`,各自十到三十分钟。
-
-**诊断由人手跑时怎么把 span 落到用例目录**:开 Claude Code 之前设两个环境变量,再发「诊断: 题面」:
-
-```bat
-set DBDOG_OBS_SPANS=D:\pair\out\OG-7601\forward\spans.jsonl
-set DBDOG_OBS_TAGS=case_id=OG-7601
-claude
-```
-
-题面末尾要带上假设书写约定(`span-graph/references/hypothesis-rules.txt` 原文),hook 才能按 `[H2<H1]` 打 tag,否则正向图是空的。跑完 spans.jsonl 就在用例目录里,批次的正向阶段直接吃。
-
-## 批量:一次给全量用例,顺序跑
-
-现象和根因各自是多用例的大文件时不用拆,写一份 `batch.md`(模板见 `batch.example.md`),几个变量:问题单文件、现象文件、根因文件、源码树、输出目录(、阶段)。runner 自己组装每个用例:
-
-- **用例清单与修复来源**:「问题单文件」一行一个单号,后面可跟修复代码链接(commit / PR / 本地 diff)和事故窗,空格或 | 分开,都可省。没有这个文件就跑根因文件标题里出现的全部单号(「用例号正则」可限定)
-- **切小节**:按单号在现象文件、根因文件里找(优先「标题行含单号」,没有标题就从含单号的那行取到下一个单号之前);根因文件里没有的单号跳过并写进汇总
-- **事故窗**:问题单文件里没给就从复现小节解析——带时间关键词(复现时间 / 执行时间 / 时间窗 / 时间…)的行优先,其次一行里有两个时间戳的行;`--check` 会逐用例打印抓到的窗
-- **修复代码**:链接是 GitHub / Gitee 的 commit、PR 就自动取 `.diff`;其它网页(如问题单页)抓下来存 `ticket.txt` 并顺着页面里的代码链接取 diff;要登录的页面不指望,抓不到就把地址交给推导角
-
-要覆盖某个单号的窗、修复来源或指定已有 span 文件时才在表里列一行。
+- **单号清单**:复现文件标题行里出现的单号(缺省认 DTS 单号 / OG-数字 / 大写字母-数字,格式特别用「用例号正则」);给了「问题单文件」就以它为清单
+- **现象**:按单号切复现文件的小节(优先「标题行含单号」,没有标题就从含单号的那行取到下一个单号之前),小节全文当题面
+- **事故窗**:复现小节里的「复现开始时间 / 复现结束时间」两行拼成「开始 ~ 结束」;没有就认带时间关键词的一行,或一行里有两个时间戳的行;问题单文件里给了就用给的
+- **根因**:按单号切根因文件的小节;没有的单号跳过并写进汇总
+- **修复代码**:根因小节或复现小节里的 commit / PR / MR / diff 链接;GitHub、Gitee 的自动取 `.diff`,其它网页抓下来存 `ticket.txt` 并顺着页面里的代码链接取 diff;要登录的页面不指望,抓不到就把地址交给推导角;都没有按 `fix_diff: absent`
 
 ```bash
-python S/batch.py batch.md --check       # 自检:环境四样 + batch.md 解析 + 每个用例能否切到;不跑
-python S/batch.py batch.md --dry-run     # 只切好每个用例的输入(输出目录\用例号\prompt.txt / root-cause.md / window.txt)、写汇总,不起模型
-python S/batch.py batch.md               # 顺序跑,用例之间歇「间隔分钟」;中断后重跑会跳过已有产物的用例
+python S/batch.py batch.md --check       # 自检:环境 + 文件 + 每个单号切到什么、窗和修复抓到什么;不跑
+python S/batch.py batch.md --dry-run     # 只切好每个单号的输入(out\<单号>\prompt.txt / root-cause.md / window.txt)、写汇总,不起模型
+python S/batch.py batch.md               # 顺序跑,单号之间歇「间隔分钟」;已有产物的单号跳过
 python S/batch.py batch.md --only DTS001,DTS002 --force
 ```
 
-表里可选加一列「span 文件」,指向那次正向诊断的 spans.jsonl,批次会顺手用 span-graph 在该用例的 `forward\` 下生成 `forward-path.md`(零模型)。
-
-修复来源那列三种都行:本地 diff 文件;GitHub/Gitee 的 PR 或 commit 链接(自动取 `.diff`);**问题单网页地址**(如 DTS 单,修复代码贴在页面里)——runner 先试着把页面抓成 `ticket.txt` 交给推导角,抓不到(要登录)就把地址交给推导角,放开 WebFetch 让它自己打开;都找不到修复代码就按 `fix_diff: absent`。
-
-产物:`输出目录\用例号\reverse\evidence-chain.md`(+ `.json`;推导角日志在 `reverse\work\`),以及 `输出目录atch-summary.md`,一行一个用例:状态、讲不讲得通的结论、四类取证计数、dbdog 侧发现条数。
+产物:`out\<单号>\evidence-chain.md`(+ `.json`;推导角日志在 `work\`),以及 `out\batch-summary.md` / `.json`,一行一个单号:状态、讲不讲得通的结论、四类取证计数、dbdog 侧发现条数。
 
 ## 环境
 
@@ -147,5 +119,5 @@ run-batch.cmd / run-batch.sh           一键:先自检再跑
 scripts/check_chain.py                 产物校验(也可单独跑:python check_chain.py evidence-chain.json;打印四类取证结果计数)
 scripts/fetch-catalog.py               刷新工具目录
 scripts/run.test.py / batch.test.py    测试
-workspace-template/                    Windows 全自动工作区模板(run.cmd / schedule.cmd / batch.md / inputs / README)
+workspace-template/                    Windows 工作区模板(run.cmd 自检→跑 / schedule.cmd 计划任务 / batch.md / inputs / README)
 ```
