@@ -126,13 +126,10 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   不阻塞 Stop（用户零等待）、后写赢；未配/失败 = 没总结，不影响 trace。设计见
   `dbdog-web/docs/design/llmobs-investigation-narrative.md`。
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
-  `DBDOG_OBS_CONTENT_CHARS`（内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS` 先例）、
+  `DBDOG_OBS_CONTENT_CHARS`（**上报侧**内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS`
+  先例；本地 `spans.jsonl` 不受它约束，超限字段另落 `<字段>_local` 全量副本，见「span 形状」）、
   `DBDOG_OBS_ML_APP`（应用名标签，打进 root/llm span 的 `tags.ml_app`；缺省 = 项目目录名。
   复盘按它过滤——同一台机器上编码会话与真诊断靠它分开）、
-  `DBDOG_OBS_STORE_LLM_INPUT`（llm span 的每轮完整 prompt 是否落本地 JSONL，默认开；
-  `0`/`off` 关；只进 `spans.jsonl`，上报前剥离）、
-  `DBDOG_OBS_CTX_BUF_CHARS`（上下文滚动缓冲上限，默认 200000 字符——每轮 prompt 从它
-  截尾，也防状态文件无限膨胀）、
   `DBDOG_OBS_REPORT_TIMEOUT_MS`（上报超时，默认 3000；透明代理/隧道后的机器放宽到
   10000–15000，见故障排查倒数第二行）、
   `DBDOG_SUMMARY_LLM_*`（诊断流程总结的 LLM 端点，**可选**）：`summaryEnv` 现先取 `DBDOG_SUMMARY_LLM_*`，
@@ -210,13 +207,22 @@ mcp 不双写、不上报，跟没装一样）：
 **一次模型调用 = 一个 llm span**：transcript 把一次 API 响应按内容块拆成多条 assistant 行
 （requestId 相同、usage 重复），合成器按 requestId 归并——逐行出 span 会虚增轮数 2-3 倍
 （首轮闭环实测坑）。
-llm span 的 `input` 恒 null（上报侧不推全文，远端只看树形与 token）；每轮完整 prompt
-按 `DBDOG_OBS_STORE_LLM_INPUT`（默认开）截尾存进本地 `input_local`（截断上限同
-`DBDOG_OBS_CONTENT_CHARS`，取尾部——新注入的内容才解释上下文为什么膨胀；系统提示不在
-transcript 里、tool_use 参数不入缓冲、长度以 usage 的 token 计数为准）。`input_local`
-**只进本地 `spans.jsonl`，reportSpans 上报前剥离**，远端 schema 不动、带宽不浪费。
 任务级 in/out 在 root span，子代理级在其 agent span。`duration_ms` 是近似值
 （前一条 entry 落盘 → 组内末行落盘），打 `duration_estimated` 标区分。
+
+**本地全量、上报截断（2026-09-08）**。原则：hook 只采原文、不做语义解析，提取（假设
+「提出」事件等）在处理侧做，所以本地 `spans.jsonl` 必须有全文：
+
+| 字段 | 远端（上报） | 本地 `spans.jsonl` |
+|------|------|------|
+| llm `output`、tool `input`/`output`、agent `input`/`output` | 按 `DBDOG_OBS_CONTENT_CHARS` 截断 | 超限时另落 `<字段>_local` 全量；未超限不落副本 |
+| llm `thinking_local` | 无此字段 | transcript 的 thinking 块全文（有才落） |
+| llm `input` | 恒 null | 恒 null——每轮完整 prompt = 之前全部对话，处理侧按 trace 内时间序从各 span 正文复原即可 |
+
+读侧口径统一 **`x_local ?? x`**。所有 `*_local` 字段 `reportSpans` 上报前剥离，远端 schema
+不动。此前的 `input_local`（每轮上下文尾部快照，2026-08-10 引入）已移除：内容全是前面 span
+正文的重复拼接，实测占本地文件 70%（254MB / 362MB）。系统提示与 CLAUDE.md 不在 transcript
+里，本地也没有——这是既有的近似声明。
 
 ## 已知语义（读侧须知）
 
@@ -248,7 +254,13 @@ transcript 里、tool_use 参数不入缓冲、长度以 usage 的 token 计数�
 - **pending 只存 span_id**：全文回捞自 `spans.jsonl`（真相源）。旧格式存全文，实测把单个
   状态文件撑到 315 KB。两种格式都兼容。
 - **宁可重发不可丢**：`span_id` 固定，服务端是 `ReplacingMergeTree` + `ORDER BY
-  (trace_id, ts, span_id)`，重复补发会被去重。任何一批失败就整体留着下次再来。
+  (trace_id, ts, span_id)`，重复补发会被去重。每批成功立即把剩余 id 写回状态文件
+  （2026-09-08），一批失败进度停在上一批、下次只发剩下的——慢链路上逐轮收敛。
+- **Stop/SessionEnd 只发本轮，积压全归 sweep**（2026-09-08）：此前 Stop 把「全部积压 +
+  本轮」一次发，积压越多包越大越发不成功，8 月 559 条从 08-12 卡到 09-08。Stop 在 15s
+  hook 超时的交互路径上，只管本轮新 span；旧 id 原样带回 pending。
+- **`spans.jsonl` 只流式扫**：sweep 先收齐所有可接管文件的 pending id、扫一次；worker 只留
+  本 trace。实测 376MB 文件回捞 559 条 1.1s / 142MB，旧的整文件读是 57s / 2GB。
 
 `spans.jsonl` 扩展名是 `.jsonl`，天然不在状态文件（`.json`）的扫描范围内——补发要靠它
 回捞，任何情况下都不得删。
@@ -259,5 +271,7 @@ transcript 里、tool_use 参数不入缓冲、长度以 usage 的 token 计数�
   重建 state 时不继承 `pending_spans`，等于把"这些 span 没送达"的事实一起抹掉。实测有
   一条 trace 本地 219 条、服务端 110 条，缺的 109 条不在任何状态文件里，sweep 无从下手。
   该缺陷已修（新一轮触发会继承 pending），但此前丢的记录只能靠人工比对本地 JSONL 补。
-- **`spans.jsonl` 无限增长**：只追加不轮转（实测 9 天 3006 行 / 5.2 MB）。收尸要按 id
-  回捞就更依赖它，不能随便删。轮转策略尚未设计。
+- **`spans.jsonl` 无限增长**：只追加不轮转（2026-09-08 实测 376MB / 56,582 行，其中 70% 是
+  已移除的 `input_local`）。读侧已全部流式，不再受文件大小威胁；但收尸要按 id 回捞就依赖它，
+  不能随便删。轮转（归档到子目录、活跃文件名不变）待做，需同步语料仓 `llmobs-ingest.py`、
+  diag-pair `from_spans.py`、dbdog-web 三处消费者。

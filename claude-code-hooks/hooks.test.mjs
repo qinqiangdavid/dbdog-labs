@@ -2208,9 +2208,8 @@ describe("codex 复审阻断项", () => {
     expect(last.tokens_output).toBe(20); // usage 是全量重复,不是增量——只算一次
     expect(last.output).toContain("part1");
     expect(last.output).toContain("part2");
-    // 复审中危:续写行的 input_local 必须仍是"本次调用之前"的快照——part1 是本次调用
-    // 自己的输出,混进去就违反语义(续写沿用首批快照)
-    expect(last.input_local ?? "").not.toContain("part1");
+    // 2026-09-08:input_local 已移除(见「本地全量、上报截断」),续写行不得再带它
+    expect(last.input_local).toBeUndefined();
     // 复审高危:root 刷新要吃到整段结论(同 requestId 多行合并后的全量,不是只取末行)
     const root = readSpans(dir).filter((s) => s.span_id === st.root_span_id).pop();
     expect(root.output).toContain("part1");
