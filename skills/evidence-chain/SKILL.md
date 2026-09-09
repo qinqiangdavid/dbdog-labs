@@ -85,7 +85,27 @@ skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-grap
 
 **同事上手三步**:① 复制 `batch.example.md` 成 `batch.md`,改路径、填用例表;② 跑 `run-batch.cmd batch.md`(mac/Linux 用 `run-batch.sh`),它先自检——Python、`claude`、MCP 连通、源码树、每个用例能不能在两个大文件里切到——红的按提示修;③ 看 `out\batch-summary.md`。
 
-**流水线**:切分 → 反向 → 正向 → 对比。前三段 `batch.py` 一次跑完;幂等,重跑跳过已有产物的用例,有用例失败退出码为 1,可直接挂 Windows 计划任务 / cron 每晚跑,batch.md 新加的行自动被捡起来。
+**流水线四段,`batch.py` 按 batch.md 里的「阶段」逐用例跑**:
+
+| 阶段 | 做什么 | 产物 | 跳过条件 |
+|---|---|---|---|
+| 切分 | 按用例号从两个大文件切出题面/根因,写事故窗 | prompt.txt / root-cause.md / window.txt | 总是重切 |
+| 诊断(可选) | 起一个带 hook + dbdog MCP 的正向诊断会话,题面拼上假设书写约定,`DBDOG_OBS_SPANS` 指到用例目录,对答案目录禁读 | spans.jsonl(+ work-diag/ 日志) | 已有 spans.jsonl |
+| 正向 | span-graph 零模型出图 | forward-path.md | 无 spans.jsonl |
+| 反向 | 本 skill 的推导角真取证 | evidence-chain.md(+ work/ 日志) | 已有 evidence-chain.md |
+| 对比 | 以后接在同一目录上 | compare.md | — |
+
+「阶段」缺省 `正向,反向`(诊断由人另跑,见下);写 `诊断,正向,反向` 就全自动。幂等,重跑只补缺的阶段,有用例失败退出码为 1,可直接挂 Windows 计划任务 / cron 每晚跑,batch.md 新加的行自动被捡起来。诊断和反向都是 `claude -p`,各自十到三十分钟。
+
+**诊断由人手跑时怎么把 span 落到用例目录**:开 Claude Code 之前设两个环境变量,再发「诊断: 题面」:
+
+```bat
+set DBDOG_OBS_SPANS=D:\pair\out\OG-7601\spans.jsonl
+set DBDOG_OBS_TAGS=case_id=OG-7601
+claude
+```
+
+题面末尾要带上假设书写约定(`span-graph/references/hypothesis-rules.txt` 原文),hook 才能按 `[H2<H1]` 打 tag,否则正向图是空的。跑完 spans.jsonl 就在用例目录里,批次的正向阶段直接吃。
 
 ## 批量:一次给全量用例,顺序跑
 

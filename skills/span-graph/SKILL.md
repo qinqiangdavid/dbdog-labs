@@ -12,7 +12,7 @@ description: hook span 转假设图/树。输入 dbdog-obs hook 产出的 spans.
 - 文件:一份 `spans.jsonl`(hook 每行一个 span),或 server 导出的 `{"spans":[...]}` / JSON 数组
 - 目录:里面有 `spans.jsonl` 就用它;也可以直接给 `~/.claude/dbdog-obs/`(整份日志,用 `--trace` 或 `--session` 筛出那一次诊断)
 
-span 来自 dbdog-obs hook:装好 hook 后发「诊断:」+ 题面,跑完 span 落在 `~/.claude/dbdog-obs/spans.jsonl`(Windows 是 `%USERPROFILE%\.claude\dbdog-obs\spans.jsonl`,或 `DBDOG_OBS_SPANS` 指定的位置)。
+span 来自 dbdog-obs hook:装好 hook 后发「诊断:」+ 题面,跑完 span 落在 `~/.claude/dbdog-obs/spans.jsonl`(Windows 是 `%USERPROFILE%\.claude\dbdog-obs\spans.jsonl`)。**想让 span 直接落到某个用例目录**,开 Claude Code 前设 `DBDOG_OBS_SPANS=<用例目录>\spans.jsonl`(可再设 `DBDOG_OBS_TAGS=case_id=<用例号>` 给 span 打标签)。题面末尾带上 `references/hypothesis-rules.txt` 的假设书写约定,agent 才会按 `[H2<H1]` 在工具调用上标假设,hook 才有 tag 可打;不带的话图里全是「未挂到假设」。
 
 ## 用法
 
@@ -44,6 +44,7 @@ python S/from_spans.py ~/.claude/dbdog-obs/spans.jsonl --trace <trace_id> --out 
 
 ```
 SKILL.md
-scripts/from_spans.py        入口
-scripts/from_spans.test.py   测试
+scripts/from_spans.py               入口
+scripts/from_spans.test.py          测试
+references/hypothesis-rules.txt     假设书写约定(拼在诊断题面末尾;与 hook、语料仓 build-hypotheses.py 同源)
 ```

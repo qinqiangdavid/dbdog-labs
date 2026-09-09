@@ -5,6 +5,9 @@
 - 源码树: D:\repo\opengauss-server
 - 输出目录: D:\pair\out
 - 间隔分钟: 5
+- 阶段: 正向,反向
+- 诊断模型档:
+- 诊断MCP配置:
 - 模型:
 - 模型档:
 - MCP配置:

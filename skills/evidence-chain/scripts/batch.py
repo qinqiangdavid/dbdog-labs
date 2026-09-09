@@ -11,8 +11,11 @@ batch.md 格式(标题任意):
   - 输出目录: 每个用例一个子目录
   - 间隔分钟: 用例之间的间隔(默认 5)
   - 模型 / 模型档 / MCP配置: 可选,透传给 run.py 的 --model / --config-dir / --mcp-config
+  - 阶段: 缺省「正向,反向」;写「诊断,正向,反向」则先起正向诊断会话(带 hook,span 落到用例目录)再出图再反向
+  - 诊断模型档 / 诊断MCP配置: 诊断会话用的模型档与 MCP(缺省同上面的)
   | 用例 | 事故窗 | 修复 | 备注 |      修复列:DTS 单地址 / PR 地址 / 本地 diff,可空
-可选列「现象文件」「根因文件」按行覆盖全局文件(直接给该用例的文件路径)。
+可选列「现象文件」「根因文件」按行覆盖全局文件;「span 文件」指向已有的 spans.jsonl(不填则用 用例目录/spans.jsonl)。
+用例目录 = 各阶段的契约:prompt.txt / root-cause.md / window.txt → spans.jsonl(诊断) → forward-path.md(正向) → evidence-chain.md(反向)。
 """
 import argparse
 import json
@@ -25,10 +28,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 KEYS = {
     "现象文件": "phenomenon_file", "根因文件": "root_cause_file", "源码树": "source", "输出目录": "out",
     "间隔分钟": "interval_min", "模型": "model", "模型档": "config_dir", "MCP配置": "mcp_config", "mcp配置": "mcp_config",
+    "阶段": "stages", "诊断模型档": "diag_config_dir", "诊断MCP配置": "diag_mcp_config", "诊断mcp配置": "diag_mcp_config",
 }
 COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note", "现象文件": "phenomenon_file", "根因文件": "root_cause_file",
         "span文件": "spans", "span 文件": "spans", "spans": "spans"}
 SPAN_GRAPH = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "scripts", "from_spans.py")
+RULES = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "references", "hypothesis-rules.txt")
+STAGES_DEFAULT = "正向,反向"
 
 
 def log(msg):
@@ -108,6 +114,76 @@ def fix_kind(fix):
             return "diff_url"
         return "ticket"
     return "file"
+
+
+def build_diag_prompt(phenomenon, window, rules_text):
+    """正向诊断的完整提示词 = 「诊断:」+ 题面({{WINDOW}} 用事故窗的时间段替换)+ 假设书写约定(hook 按它打 tag,缺了正向图就空)。"""
+    p = phenomenon.strip()
+    if window:
+        p = p.replace("{{WINDOW}}", window.split(",")[0].strip())
+    if not re.match(r"^\s*(诊断|diag)\s*[:：]", p, re.I):
+        p = "诊断: " + p
+    return p + "\n\n" + rules_text.strip() + "\n"
+
+
+def diag_env(base, cdir, case_id, config_dir=None):
+    """诊断会话的环境:span 直接落到用例目录,hook 状态也隔离到用例目录,span 打上 case_id 标签。"""
+    env = dict(base)
+    env["DBDOG_OBS_SPANS"] = os.path.join(cdir, "spans.jsonl")
+    env["DBDOG_OBS_DIR"] = os.path.join(cdir, "obs-state")
+    env["DBDOG_OBS_TAGS"] = f"case_id={case_id}"
+    env["DBDOG_OBS_ML_APP"] = env.get("DBDOG_OBS_ML_APP") or "evidence-pipeline"
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def diag_settings(out_dir):
+    """诊断会话对答案盲:禁读整个输出目录(root-cause.md / evidence-chain.md 都在里面)与联网。"""
+    root = os.path.abspath(out_dir).replace("\\", "/")
+    pats = [f"{t}(//{root}/**)" for t in ("Read", "Grep", "Glob")]
+    return {"permissions": {"deny": ["WebSearch", "WebFetch", *pats, "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(scp:*)"]}}
+
+
+def diagnose(cid, cdir, phenomenon, window, st, absp):
+    """阶段「诊断」:起一个带 hook + dbdog MCP 的 claude -p 跑正向诊断,span 落到 cdir/spans.jsonl。"""
+    import shutil, subprocess
+    wd = os.path.join(cdir, "work-diag")
+    os.makedirs(wd, exist_ok=True)
+    rules = read(RULES) if os.path.isfile(RULES) else ""
+    if not rules:
+        log(f"{cid}:⚠ 找不到假设书写约定 {RULES},正向图会没有假设 tag")
+    prompt = build_diag_prompt(phenomenon, window, rules)
+    write(os.path.join(wd, "prompt.used.txt"), prompt)
+    sp = os.path.join(wd, "settings.json")
+    write(sp, json.dumps(diag_settings(os.path.dirname(cdir)), ensure_ascii=False, indent=1))
+    claude_bin = next((shutil.which(n) for n in ("claude", "claude.cmd", "claude.exe") if shutil.which(n)), None)
+    if not claude_bin:
+        raise SystemExit("找不到 claude 命令")
+    cmd = [claude_bin, "-p", prompt, "--dangerously-skip-permissions", "--settings", sp, "--disallowedTools", "WebSearch,WebFetch"]
+    mcp = st.get("diag_mcp_config") or st.get("mcp_config")
+    if mcp:
+        cmd += ["--mcp-config", absp(mcp), "--strict-mcp-config"]
+    cwd = absp(st["source"]) if st.get("source") and os.path.isdir(absp(st["source"])) else cdir
+    env = diag_env(os.environ, cdir, cid, st.get("diag_config_dir") or st.get("config_dir") or None)
+    log(f"{cid}:诊断 · cwd={cwd} · span→{env['DBDOG_OBS_SPANS']} · 模型档 {env.get('CLAUDE_CONFIG_DIR') or '<默认>'}")
+    with open(os.path.join(wd, "diag.stdout"), "w", encoding="utf-8") as so, open(os.path.join(wd, "diag.err"), "w", encoding="utf-8") as se:
+        rc = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se).returncode
+    if rc != 0:
+        log(f"{cid}:⚠ 诊断会话退出码 {rc},看 {wd}/diag.err")
+    ok = os.path.isfile(env["DBDOG_OBS_SPANS"]) and os.path.getsize(env["DBDOG_OBS_SPANS"]) > 0
+    log(f"{cid}:诊断 " + ("✓ span 已落盘" if ok else "✗ 没有 span(hook 没装?触发词?看 diag.err)"))
+    return ok
+
+
+def forward(cid, cdir, spans_path):
+    import subprocess
+    if not (os.path.isfile(spans_path) and os.path.isfile(SPAN_GRAPH)):
+        log(f"{cid}:⚠ span 文件或 span-graph skill 不在({spans_path}),跳过正向图")
+        return False
+    r = subprocess.run([sys.executable, SPAN_GRAPH, spans_path, "--out", cdir], capture_output=True, text=True)
+    log(f"{cid}:正向图 " + ("✓" if r.returncode == 0 else "✗ " + r.stderr.strip()[-200:]))
+    return r.returncode == 0
 
 
 def summarize(out_dir, rows):
@@ -192,6 +268,10 @@ def check(manifest_path):
                 problems.append(f"MCP配置不是合法 JSON:{e}")
     else:
         notes.append("MCP配置:未指定,将继承 claude 配置目录里已配的 MCP(确认里面有 dbdog)")
+    stages = st.get("stages") or STAGES_DEFAULT
+    notes.append(f"阶段:{stages}" + ("(含诊断:需要 hook 已装、假设书写约定 " + ("在" if os.path.isfile(RULES) else "缺失!") + ")" if "诊断" in stages else ""))
+    if "正向" in stages and not os.path.isfile(SPAN_GRAPH):
+        problems.append(f"span-graph skill 不在:{SPAN_GRAPH}(正向图要它)")
     ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") and os.path.isfile(absp(st["phenomenon_file"])) else ""
     rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") and os.path.isfile(absp(st["root_cause_file"])) else ""
     ids = [c["id"] for c in cases]
@@ -233,8 +313,6 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
         os.makedirs(cdir, exist_ok=True)
         row = {"id": cid, "status": "", "detail": ""}
         rows.append(row)
-        if os.path.isfile(os.path.join(cdir, "evidence-chain.md")) and not force and not dry_run:
-            row["status"] = "skipped_existing"; log(f"{cid}:已有产物,跳过(--force 重跑)"); continue
         ph = read(absp(c["phenomenon_file"])) if c.get("phenomenon_file") else extract_section(ph_all, cid, ids)
         if not ph:
             row["status"] = "skipped_no_phenomenon"; log(f"{cid}:现象文件里没找到该用例,跳过"); continue
@@ -244,14 +322,18 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
         write(os.path.join(cdir, "prompt.txt"), ph)
         write(os.path.join(cdir, "root-cause.md"), rc)
         write(os.path.join(cdir, "window.txt"), (c.get("window") or "").strip() + "\n")
-        if c.get("spans"):
-            sp = absp(c["spans"])
-            if os.path.exists(sp) and os.path.isfile(SPAN_GRAPH):
-                import subprocess
-                r = subprocess.run([sys.executable, SPAN_GRAPH, sp, "--out", cdir], capture_output=True, text=True)
-                log(f"{cid}:正向图 " + ("✓" if r.returncode == 0 else "✗ " + r.stderr.strip()[-200:]))
-            else:
-                log(f"{cid}:⚠ span 文件或 span-graph skill 不在({sp}),跳过正向图")
+        stages = [x.strip() for x in re.split(r"[,，\s]+", st.get("stages") or STAGES_DEFAULT) if x.strip()]
+        spans_path = absp(c["spans"]) if c.get("spans") else os.path.join(cdir, "spans.jsonl")
+        planned = []
+        if "诊断" in stages and (force or not (os.path.isfile(spans_path) and os.path.getsize(spans_path) > 0)):
+            planned.append("诊断")
+        if "正向" in stages:
+            planned.append("正向")
+        if "反向" in stages and (force or not os.path.isfile(os.path.join(cdir, "evidence-chain.md"))):
+            planned.append("反向")
+        row["stages"] = planned
+        if not planned:
+            row["status"] = "skipped_existing"; log(f"{cid}:各阶段产物都在,跳过(--force 重跑)"); continue
         args = ["--phenomenon", os.path.join(cdir, "prompt.txt"), "--root-cause", os.path.join(cdir, "root-cause.md"),
                 "--out", cdir, "--work", os.path.join(cdir, "work")]
         if c.get("window"):
@@ -270,11 +352,16 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
             args.append("--force")
         log(f"{cid}:修复来源={kind} · 窗={c.get('window') or '无'}")
         if dry_run:
-            write(os.path.join(cdir, "dry-run.txt"), "python run.py " + " ".join(args) + "\n")
+            write(os.path.join(cdir, "dry-run.txt"), "阶段: " + " → ".join(planned) + "\npython run.py " + " ".join(args) + "\n")
             row["status"] = "dry_run"; continue
         try:
-            ec.main(args)
-            row["status"] = "done"
+            if "诊断" in planned:
+                diagnose(cid, cdir, ph, c.get("window"), st, absp)
+            if "正向" in planned:
+                forward(cid, cdir, spans_path)
+            if "反向" in planned:
+                ec.main(args)
+            row["status"] = "done"; row["detail"] = "+".join(planned)
         except SystemExit as e:
             row["status"] = "failed"; row["detail"] = str(e)
         except Exception as e:  # 一个用例失败不拖累整批
