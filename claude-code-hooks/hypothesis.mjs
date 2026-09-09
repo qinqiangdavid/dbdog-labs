@@ -2,7 +2,8 @@
 // opengauss-issue-corpus/loop/lib/hypothesis-rules.txt
 // 必须与 loop/lib/build-hypotheses.py、dbdog-web/src/lib/llmobs-hypothesis-tree.ts 对齐。
 const ID = "H[0-9]+(?:\\.[0-9]+)*";
-const HEAD = new RegExp(`^\\s*\\[\\s*(${ID})\\s*(?:<\\s*(${ID}))?\\s*\\]\\s*([\\s\\S]*)$`);
+// 父编号后可带一个多余的 >：模板「[H<编号><H<父编号>]」常被照抄成 [H2.1<H2>]（2026-09-09 一轮 21 次）
+const HEAD = new RegExp(`^\\s*\\[\\s*(${ID})\\s*(?:<\\s*(${ID})\\s*>?)?\\s*\\]\\s*([\\s\\S]*)$`);
 const KV = /^\s*(假设|判据|关|意图|类型)\s*=\s*(.*?)\s*$/;
 const RES = new RegExp(`^\\s*(${ID})\\s*:\\s*(证伪|证实|未决)\\s*$`);
 const TYPE = { 现象确认: "confirm", 根因: "cause", 前提: "confirm" };

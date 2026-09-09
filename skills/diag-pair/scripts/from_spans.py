@@ -15,7 +15,7 @@ import re
 import sys
 
 ID = r"H[0-9]+(?:\.[0-9]+)*"
-HEAD = re.compile(rf"^\s*\[\s*({ID})\s*(?:<\s*({ID}))?\s*\]\s*(.*)$", re.S)
+HEAD = re.compile(rf"^\s*\[\s*({ID})\s*(?:<\s*({ID})\s*>?)?\s*\]\s*(.*)$", re.S)   # 父编号后可带多余的 >(模板被照抄成 [H2.1<H2>])
 KV = re.compile(r"^\s*(假设|判据|关|意图|类型)\s*=\s*(.*?)\s*$")
 RES = re.compile(rf"^\s*({ID})\s*:\s*(证伪|证实|未决)\s*$")
 TYPE = {"现象确认": "confirm", "根因": "cause", "前提": "confirm"}

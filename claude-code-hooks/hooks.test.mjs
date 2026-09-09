@@ -61,6 +61,14 @@ describe("hypothesis intent tags", () => {
   it("leaves unformatted intent untagged", () => {
     expect(hypothesisTags("look up trace")).toEqual({});
   });
+
+  it("兼容父编号带尾部 > 的写法 [H2.1<H2>]（模板 [H<编号><H<父编号>] 被照抄的形态，2026-09-09 一轮 21 次）", () => {
+    const p = parseIntent("[H2.1<H2>] 类型=根因; 假设=扫描量对不上; 判据=temp_bytes 反推");
+    expect(p?.id).toBe("H2.1");
+    expect(p?.parent).toBe("H2");
+    expect(p?.text).toBe("扫描量对不上");
+    expect(hypothesisTags("[ H4.1 < H4 > ] 假设=x").parent_hypothesis_id).toBe("H4");
+  });
 });
 
 describe("Agent Obs hook trigger", () => {

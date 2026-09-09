@@ -152,6 +152,12 @@ class FromSpans(unittest.TestCase):
         self.assertIn("提出于正文", md)
         self.assertNotIn("hook 采不到", md)
 
+    def test_head_tolerates_trailing_gt_on_parent(self):
+        # 模板 [H<编号><H<父编号>] 被照抄成 [H2.1<H2>](2026-09-09 一轮 21 次),父编号后多个 >
+        p = fs.parse_intent("[H2.1<H2>] 类型=根因; 假设=扫描量对不上; 判据=temp_bytes 反推")
+        self.assertEqual((p["id"], p["parent"], p["text"]), ("H2.1", "H2", "扫描量对不上"))
+        self.assertEqual(fs.parse_intent("[ H4.1 < H4 > ] 假设=x")["parent"], "H4")
+
     def test_dir_resolves_spans_jsonl(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "spans.jsonl")
