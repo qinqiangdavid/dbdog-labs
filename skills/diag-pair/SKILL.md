@@ -54,9 +54,9 @@ python S/run_pair.py forward ~/.claude/dbdog-obs/spans.jsonl --trace <trace_id> 
 
 产物默认写在输入旁(目录形态写在该目录里):`forward-path.md` + `forward-path.json`。
 
-图从 span 已有字段长:`tags.hypothesis_id` / `parent_hypothesis_id` 优先,否则解析 intent 的 `[H2<H1] 类型=…; 假设=…; 判据=…; 关=…; 意图=…`。三类东西会被如实标出来、不编造:
+图从 span 已有字段长:`tags.hypothesis_id` / `parent_hypothesis_id` 优先,否则解析 intent 的 `[H2<H1] 类型=…; 假设=…; 判据=…; 关=…; 意图=…`。写在正文里的「提出 [H2] 类型=…; 假设=…」也采:扫 llm/agent span 的正文(本地 spans.jsonl 的全量字段 `output_local` / `thinking_local` 优先,server 导出只有截断后的 `output`),规则与语料仓 build-hypotheses.py 同一套(复述约定与示例行跳过、最早一次为准)。三类东西会被如实标出来、不编造:
 
-- **未声明的假设**:只在 `[H2.1<H2]` 或 `关=` 里被引用、从没有调用以 `[H2]` 开头——通常是「提出 [H2]」写在正文里,hook 采不到
+- **未声明的假设**:只在 `[H2.1<H2]` 或 `关=` 里被引用、从没有调用以 `[H2]` 开头。正文里有「提出」行的会标「提出于正文」并带上假设文本;正文里也没有的才是真空节点
 - **intent 写了字段但没 `[H..]` 头**:被测 agent 没守约定,单独列出并附原文
 - **不带 intent 的调用**:Bash/Read/Agent 派发等本地工具,按工具名计数
 

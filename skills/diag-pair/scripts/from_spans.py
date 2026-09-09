@@ -4,6 +4,9 @@
 
 输入:spans.jsonl(每行一个 span)/ server 导出 {"spans":[...]} / 含 spans.jsonl 的目录。
 解析与 hook hypothesis.mjs、loop/lib/build-hypotheses.py 对齐:tags 优先,否则解析 intent 的 [H2<H1] 头。
+正文「提出」事件(2026-09-08):hook 只采原文不做语义解析,「提出 [H2] 类型=…; 假设=…」写在正文里的
+父节点从 llm/agent span 的正文提——本地 spans.jsonl 全量字段 output_local / thinking_local 优先
+(读侧口径 x_local ?? x),server 导出只有截断后的 output。正则与跳过规则同 build-hypotheses.py。
 """
 import argparse
 import json
@@ -19,6 +22,9 @@ TYPE = {"现象确认": "confirm", "根因": "cause", "前提": "confirm"}
 VERDICT = {"证伪": "falsified", "证实": "confirmed", "未决": "open"}
 TYPE_ZH = {"confirm": "现象确认", "cause": "根因"}
 VERDICT_ZH = {"falsified": "证伪", "confirmed": "证实", "open": "未决"}
+PROPOSE = re.compile(rf"提出\s*\[\s*({ID})")                              # 正文里显式提出
+PROTOCOL_RESTATE = re.compile(r"书写约定|telemetry\.intent|格式固定")       # 复述约定的行不算提出
+RESTATE_LINE = re.compile(r"示例|H<编号|假设=<|判据=<|\[H\d[^\]]*\]\s*假设=")   # 模板/示例行(占位符或示例编号)
 
 
 def normalize(s):
@@ -109,6 +115,36 @@ def parsed_from_span(s):
     return parse_intent(span_intent(s))
 
 
+def prose_fields(s):
+    """llm/agent span 可扫的正文:(来源名, 文本)。本地全量字段优先,server 导出退回截断值。"""
+    out = []
+    body = s.get("output_local") if isinstance(s.get("output_local"), str) else s.get("output")
+    if isinstance(body, str) and body.strip():
+        out.append(("output", body))
+    th = s.get("thinking_local")
+    if isinstance(th, str) and th.strip():
+        out.append(("thinking", th))
+    return out
+
+
+def scan_proposals(text):
+    """正文里的「提出 [H2] 类型=…; 假设=…」→ [(hid, parsed)],按出现顺序。
+    复述约定的行、模板/示例行整行跳过(否则示例编号会被当成提出)。"""
+    if not isinstance(text, str) or not text.strip():
+        return []
+    norm = normalize(text)
+    kept = [l for l in norm.split("\n") if not (PROTOCOL_RESTATE.search(l) or RESTATE_LINE.search(l))]
+    norm = "\n".join(kept)
+    found = []
+    for m in PROPOSE.finditer(norm):
+        line_end = norm.find("\n", m.end())
+        body = norm[m.start() + 2:line_end if line_end != -1 else len(norm)].strip()   # 去掉「提出」二字
+        p = parse_intent(body)
+        if p:
+            found.append((m.group(1), p))
+    return found
+
+
 def read_jsonl(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -162,7 +198,8 @@ def load_spans(path, session=None, trace=None):
 def ensure(nodes, hid):
     if hid not in nodes:
         nodes[hid] = {"id": hid, "parent": None, "type": None, "text": None, "expect": None,
-                      "verdict": "open", "declared": False, "first_seq": None, "closed_by": None, "calls": []}
+                      "verdict": "open", "declared": False, "first_seq": None, "closed_by": None,
+                      "proposed_in": None, "calls": []}
     return nodes[hid]
 
 
@@ -202,6 +239,14 @@ def build(spans):
         if s.get("kind") != "tool":
             if p:
                 fill(ensure(nodes, p["id"]), p)
+            # 正文「提出」事件:最早一次为准(span 已按 ts 排序;同 span 内 output 先于 thinking 无所谓,
+            # 同一 hid 只记第一次)
+            for source, text in prose_fields(s):
+                for hid, pp in scan_proposals(text):
+                    n = ensure(nodes, hid)
+                    if n["proposed_in"] is None:
+                        n["proposed_in"] = {"span_id": s.get("span_id"), "in": source}
+                        fill(n, pp)
             continue
         seq += 1
         tool = (s.get("name") or "").replace("mcp__dbdog__", "")
@@ -257,6 +302,7 @@ def build(spans):
             "resolve_edges": len(resolve_edges),
             "unattached_tools": len(unattached),
             "unattached_intent_without_head": sum(1 for u in unattached if u["reason"] == "intent_without_head"),
+            "proposed_in_prose": sum(1 for n in node_list if n.get("proposed_in")),
         },
     }
 
@@ -276,7 +322,8 @@ def render_md(g):
         f"- span {g['span_count']} 条,其中工具调用 {g['tool_call_count']} 次",
         f"- 假设 {s['hypotheses']} 个(其中 {s['undeclared']} 个只被引用、未在调用上声明)· "
         f"假设↔假设边 {s['parent_edges']} · 假设↔工具边 {s['tool_edges']} · 收口边 {s['resolve_edges']} · "
-        f"未挂到假设的工具调用 {s['unattached_tools']}(其中 {s['unattached_intent_without_head']} 次写了字段但 intent 不带 [H..] 头)",
+        f"未挂到假设的工具调用 {s['unattached_tools']}(其中 {s['unattached_intent_without_head']} 次写了字段但 intent 不带 [H..] 头)· "
+        f"正文提出 {s.get('proposed_in_prose', 0)}",
         "",
         "读法:节点 = 假设;缩进 = `[H2.1<H2]` 声明的父子关系;每个假设下面的表 = 该假设名下的工具调用(seq 是整条 trace 的全局序号,可据此看先后)。",
         "",
@@ -300,9 +347,18 @@ def render_md(g):
             title += f"(由 {n['closed_by']['from']} 在 seq {n['closed_by']['seq']} 关闭)"
         lines.append(title)
         lines.append("")
-        if not n["declared"]:
-            lines.append(f"- 未声明:没有任何工具调用以 `[{n['id']}]` 开头,只在子假设或收口里被引用;"
-                         "假设正文若写在正文而非 intent 里,hook 采不到。")
+        if n.get("proposed_in"):
+            src = "思考块" if n["proposed_in"]["in"] == "thinking" else "正文"
+            lines.append(f"- 提出于{src}(span `{n['proposed_in']['span_id']}`):{n.get('text') or '(未写 假设=)'}")
+            if n.get("expect"):
+                lines.append(f"- 判据:{n['expect']}")
+            if not n["declared"]:
+                lines.append(f"- 未声明:没有任何工具调用以 `[{n['id']}]` 开头(只在正文提出、由子假设取证)。")
+            else:
+                lines.append(f"- 首次出现:seq {n['first_seq']}")
+        elif not n["declared"]:
+            lines.append(f"- 未声明:没有任何工具调用以 `[{n['id']}]` 开头,只在子假设或收口里被引用,"
+                         "正文里也没有「提出 [H..]」行(server 导出的 output 截断过,本地 spans.jsonl 才是全量)。")
         else:
             lines.append(f"- 假设:{n.get('text') or '(未写 假设=)'}")
             lines.append(f"- 判据:{n.get('expect') or '(未写 判据=)'}")
