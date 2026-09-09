@@ -57,15 +57,48 @@ python S/run.py 题目目录 --source 源码树目录      # 目录里有 prompt
 
 How do we know 的顺序是「先想要什么证据,再想用什么取,再真取」,工具目录只约束命名,不约束该不该列。之后与正向图对比时,前三类结论(无工具 / 应有结果但没有 / 结果不对)只看 How do we know 和附录就能定,与 agent 无关;「假设提错」「工具调错」由对比的模型拿正向图对着 Why 和 How do we know 判。
 
+## 工作区目录结构(同事照这个摆,流水线各阶段靠用例目录衔接)
+
+```
+D:\pair\                       ← 工作区(各自一份或共享盘)
+├── batch.md                   ← 批次文件:全局设置 + 用例表,唯一要手写的东西(模板 batch.example.md)
+├── inputs\
+│   ├── reproduce.md           ← 多用例现象文件
+│   ├── filter.md              ← 多用例根因文件
+│   └── fixes\                 ← 本地 diff 放这;DTS 单、PR 直接写链接
+├── mcp.json                   ← dbdog MCP 配置(可选,不给就继承 claude 自己的)
+└── out\                       ← 输出,一个用例一个子目录 = 各阶段的契约
+    ├── batch-summary.md       ← 给人看
+    ├── batch-summary.json     ← 给调度/程序看
+    └── <用例号>\
+        ├── prompt.txt         ← 阶段 0 切分:题面
+        ├── root-cause.md      ← 阶段 0:根因
+        ├── window.txt         ← 阶段 0:事故窗
+        ├── work\              ← 阶段 1 反向:推导角工作目录(claude.err / case.md / ticket.txt),失败看这
+        ├── evidence-chain.md  ← 阶段 1 产物(+ .json)
+        ├── spans.jsonl        ← 阶段 2 正向的输入:那次诊断的 hook span(人放进来,或 batch.md 的「span 文件」列指过来)
+        ├── forward-path.md    ← 阶段 2 产物(span-graph,零模型,batch 顺手生成)
+        └── compare.md         ← 阶段 3 对比(以后接在同一目录上)
+```
+
+skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-graph\`(插件或 zip),工作区只放数据和产物。
+
+**同事上手三步**:① 复制 `batch.example.md` 成 `batch.md`,改路径、填用例表;② 跑 `run-batch.cmd batch.md`(mac/Linux 用 `run-batch.sh`),它先自检——Python、`claude`、MCP 连通、源码树、每个用例能不能在两个大文件里切到——红的按提示修;③ 看 `out\batch-summary.md`。
+
+**流水线**:切分 → 反向 → 正向 → 对比。前三段 `batch.py` 一次跑完;幂等,重跑跳过已有产物的用例,有用例失败退出码为 1,可直接挂 Windows 计划任务 / cron 每晚跑,batch.md 新加的行自动被捡起来。
+
 ## 批量:一次给全量用例,顺序跑
 
 现象和根因各自是多用例的大文件时不用拆,写一份 `batch.md`(模板见 `batch.example.md`):上面几行全局设置(现象文件、根因文件、源码树、输出目录、间隔分钟,可选模型/模型档/MCP配置),下面一张表一行一个用例(用例号、事故窗、修复来源、备注)。runner 按用例号在两个大文件里找小节(优先「标题行含用例号」,没有标题就从含用例号的那行取到下一个用例号之前);根因文件里没有的用例自动跳过并写进汇总。
 
 ```bash
-python S/batch.py batch.md --dry-run     # 只切好每个用例的输入(输出目录\用例号\prompt.txt / root-cause.md / window.txt)、写汇总,不起模型;先用它核切分对不对
+python S/batch.py batch.md --check       # 自检:环境四样 + batch.md 解析 + 每个用例能否切到;不跑
+python S/batch.py batch.md --dry-run     # 只切好每个用例的输入(输出目录\用例号\prompt.txt / root-cause.md / window.txt)、写汇总,不起模型
 python S/batch.py batch.md               # 顺序跑,用例之间歇「间隔分钟」;中断后重跑会跳过已有产物的用例
 python S/batch.py batch.md --only DTS001,DTS002 --force
 ```
+
+表里可选加一列「span 文件」,指向那次正向诊断的 spans.jsonl,批次会顺手用 span-graph 在同一用例目录里生成 `forward-path.md`(零模型)。
 
 修复来源那列三种都行:本地 diff 文件;GitHub/Gitee 的 PR 或 commit 链接(自动取 `.diff`);**问题单网页地址**(如 DTS 单,修复代码贴在页面里)——runner 先试着把页面抓成 `ticket.txt` 交给推导角,抓不到(要登录)就把地址交给推导角,放开 WebFetch 让它自己打开;都找不到修复代码就按 `fix_diff: absent`。
 
@@ -85,8 +118,9 @@ SKILL.md
 prompts/chain.md                       推导角提示词
 references/dbdog-tool-catalog.json     工具目录快照
 scripts/run.py                         单用例入口
-scripts/batch.py                       批量入口(读 batch.md,顺序跑,写 batch-summary.md)
+scripts/batch.py                       批量入口(--check 自检 / --dry-run 切分 / 顺序跑,写 batch-summary.md+.json)
 batch.example.md                       批次文件模板
+run-batch.cmd / run-batch.sh           一键:先自检再跑
 scripts/check_chain.py                 产物校验(也可单独跑:python check_chain.py evidence-chain.json;打印四类取证结果计数)
 scripts/fetch-catalog.py               刷新工具目录
 scripts/run.test.py / batch.test.py    测试

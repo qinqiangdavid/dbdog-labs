@@ -9,9 +9,9 @@
 - 模型档:
 - MCP配置:
 
-| 用例 | 事故窗 | 修复 | 备注 |
-|---|---|---|---|
-| DTS2026090100123 | 2026-09-09 09:04–09:07 (UTC+8),实例 opengauss-xxx,库 bench | https://dts.example.com/issue/123 | 修复代码在单子网页里 |
-| DTS2026090100456 | 2026-09-09 10:12–10:15 (UTC+8),实例 opengauss-xxx,库 bench | https://gitee.com/opengauss/openGauss-server/pulls/8080 | PR 链接,自动取 .diff |
-| DTS2026090100789 | 2026-09-09 11:00–11:03 (UTC+8),实例 opengauss-xxx,库 bench | D:\cases\789.diff | 本地 diff |
-| DTS2026090100999 | 2026-09-09 12:00–12:03 (UTC+8),实例 opengauss-xxx,库 bench | | 没有修复代码,按 fix_diff: absent |
+| 用例 | 事故窗 | 修复 | span 文件 | 备注 |
+|---|---|---|---|---|
+| DTS2026090100123 | 2026-09-09 09:04–09:07 (UTC+8),实例 opengauss-xxx,库 bench | https://dts.example.com/issue/123 | D:\spans\123\spans.jsonl | 修复代码在单子网页里;有 span 就顺手出正向图 |
+| DTS2026090100456 | 2026-09-09 10:12–10:15 (UTC+8),实例 opengauss-xxx,库 bench | https://gitee.com/opengauss/openGauss-server/pulls/8080 | | PR 链接,自动取 .diff |
+| DTS2026090100789 | 2026-09-09 11:00–11:03 (UTC+8),实例 opengauss-xxx,库 bench | D:\cases\789.diff | | 本地 diff |
+| DTS2026090100999 | 2026-09-09 12:00–12:03 (UTC+8),实例 opengauss-xxx,库 bench | | | 没有修复代码,按 fix_diff: absent |

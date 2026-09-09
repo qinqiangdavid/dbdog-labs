@@ -99,6 +99,22 @@ class Manifest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(d, "out", "batch-summary.md")))
             summ = open(os.path.join(d, "out", "batch-summary.md"), encoding="utf-8").read()
             self.assertIn("DTS003", summ); self.assertIn("根因", summ)
+            import json
+            js = json.load(open(os.path.join(d, "out", "batch-summary.json"), encoding="utf-8"))
+            self.assertEqual([c["id"] for c in js["cases"]], ["DTS001", "DTS002", "DTS003"])
+            self.assertIn("--work", open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read())
+
+    def test_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
+            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
+            os.makedirs(os.path.join(d, "src"))
+            mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d))
+            problems, notes = b.check(mp)
+            joined = "\n".join(problems)
+            self.assertIn("DTS002:修复 diff 文件不存在", joined)   # fix2.diff 没建
+            self.assertNotIn("DTS001", joined)
+            self.assertTrue(any("DTS003:根因文件里没有" in n for n in notes))
 
 
 if __name__ == "__main__":

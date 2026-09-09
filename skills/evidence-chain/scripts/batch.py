@@ -26,7 +26,9 @@ KEYS = {
     "现象文件": "phenomenon_file", "根因文件": "root_cause_file", "源码树": "source", "输出目录": "out",
     "间隔分钟": "interval_min", "模型": "model", "模型档": "config_dir", "MCP配置": "mcp_config", "mcp配置": "mcp_config",
 }
-COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note", "现象文件": "phenomenon_file", "根因文件": "root_cause_file"}
+COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note", "现象文件": "phenomenon_file", "根因文件": "root_cause_file",
+        "span文件": "spans", "span 文件": "spans", "spans": "spans"}
+SPAN_GRAPH = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "scripts", "from_spans.py")
 
 
 def log(msg):
@@ -62,7 +64,7 @@ def parse_manifest(text):
             if row.get("id"):
                 cases.append({"id": row["id"], "window": row.get("window", ""), "fix": row.get("fix", ""),
                               "note": row.get("note", ""), "phenomenon_file": row.get("phenomenon_file", ""),
-                              "root_cause_file": row.get("root_cause_file", "")})
+                              "root_cause_file": row.get("root_cause_file", ""), "spans": row.get("spans", "")})
     try:
         settings["interval_min"] = float(settings.get("interval_min", "5") or 5)
     except ValueError:
@@ -110,8 +112,9 @@ def fix_kind(fix):
 
 def summarize(out_dir, rows):
     lines = ["# 反向推导批次汇总", "", f"- 生成时间:{time.strftime('%Y-%m-%d %H:%M:%S')}", f"- 用例数:{len(rows)}", "",
-             "| 用例 | 状态 | 讲不讲得通 | 符合 | 不符 | 空/报错 | 无工具 | dbdog 侧发现 | 产物 |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "| 用例 | 状态 | 讲不讲得通 | 符合 | 不符 | 空/报错 | 无工具 | dbdog 侧发现 | 反向产物 | 正向图 |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    js_rows = []
     status_zh = {"done": "完成", "dry_run": "只备好输入", "skipped_no_root_cause": "跳过:根因文件里没有该用例",
                  "skipped_no_phenomenon": "跳过:现象文件里没有该用例", "skipped_existing": "已有产物,跳过", "failed": "失败"}
     for r in rows:
@@ -129,10 +132,83 @@ def summarize(out_dir, rows):
             except ValueError:
                 verdict = "json 不合法"
         md = os.path.join(out_dir, r["id"], "evidence-chain.md")
+        fp = os.path.join(out_dir, r["id"], "forward-path.md")
         lines.append(f"| {r['id']} | {status_zh.get(r['status'], r['status'])}{(':' + r['detail']) if r.get('detail') else ''} | {verdict} | "
                      f"{cnt['obtained_match']} | {cnt['obtained_mismatch']} | {cnt['empty_or_error']} | {cnt['no_tool']} | {nf} | "
-                     f"{'evidence-chain.md' if os.path.isfile(md) else ''} |")
+                     f"{'evidence-chain.md' if os.path.isfile(md) else ''} | {'forward-path.md' if os.path.isfile(fp) else ''} |")
+        js_rows.append({"id": r["id"], "status": r["status"], "detail": r.get("detail", ""), "verdict": verdict,
+                        "outcomes": {k: (v or 0) for k, v in cnt.items()}, "dbdog_findings": nf or 0,
+                        "evidence_chain_md": md if os.path.isfile(md) else None, "forward_path_md": fp if os.path.isfile(fp) else None})
     write(os.path.join(out_dir, "batch-summary.md"), "\n".join(lines) + "\n")
+    write(os.path.join(out_dir, "batch-summary.json"), json.dumps({"generated": time.strftime("%Y-%m-%d %H:%M:%S"), "cases": js_rows}, ensure_ascii=False, indent=2) + "\n")
+
+
+def check(manifest_path):
+    """自检:环境四样 + batch.md 能解析 + 每个用例能切到现象/根因。返回问题列表(空=可以跑)。"""
+    import shutil, urllib.request
+    problems, notes = [], []
+    if sys.version_info < (3, 8):
+        problems.append(f"Python 需要 3.8+,当前 {sys.version.split()[0]}")
+    cl = next((shutil.which(n) for n in ("claude", "claude.cmd", "claude.exe") if shutil.which(n)), None)
+    (notes if cl else problems).append(f"claude CLI:{cl or '找不到,请安装 Claude Code 并加入 PATH'}")
+    try:
+        m = parse_manifest(read(manifest_path))
+    except Exception as e:
+        return [f"batch.md 读不了:{e}"], notes
+    st, cases = m["settings"], m["cases"]
+    base = os.path.dirname(os.path.abspath(manifest_path))
+    def absp(p):
+        return os.path.abspath(os.path.join(base, p)) if p and not os.path.isabs(p) else p
+    if not cases:
+        problems.append("batch.md 里没有用例表(| 用例 | 事故窗 | 修复 | 备注 |)")
+    for k, zh in (("phenomenon_file", "现象文件"), ("root_cause_file", "根因文件")):
+        if not st.get(k):
+            notes.append(f"{zh}:未配置,每行要自带「{zh}」列")
+        elif not os.path.isfile(absp(st[k])):
+            problems.append(f"{zh}不存在:{absp(st[k])}")
+    if st.get("source") and not os.path.isdir(absp(st["source"])):
+        problems.append(f"源码树不存在:{absp(st['source'])}")
+    elif not st.get("source"):
+        notes.append("源码树:未配置,代码路径将全部 verified=false")
+    if st.get("mcp_config"):
+        mp = absp(st["mcp_config"])
+        if not os.path.isfile(mp):
+            problems.append(f"MCP配置不存在:{mp}")
+        else:
+            try:
+                cfg = json.load(open(mp, encoding="utf-8"))
+                for name, srv in (cfg.get("mcpServers") or {}).items():
+                    url = srv.get("url")
+                    if not url:
+                        continue
+                    req = urllib.request.Request(url, data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "evidence-chain-check", "version": "0"}}}).encode(),
+                                                 headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **(srv.get("headers") or {})}, method="POST")
+                    try:
+                        with urllib.request.urlopen(req, timeout=20) as r:
+                            notes.append(f"MCP {name}:HTTP {r.status} 可达")
+                    except Exception as e:
+                        problems.append(f"MCP {name} 连不上:{url} ({e})")
+            except ValueError as e:
+                problems.append(f"MCP配置不是合法 JSON:{e}")
+    else:
+        notes.append("MCP配置:未指定,将继承 claude 配置目录里已配的 MCP(确认里面有 dbdog)")
+    ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") and os.path.isfile(absp(st["phenomenon_file"])) else ""
+    rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") and os.path.isfile(absp(st["root_cause_file"])) else ""
+    ids = [c["id"] for c in cases]
+    for c in cases:
+        cid = c["id"]
+        if not (c.get("phenomenon_file") or extract_section(ph_all, cid, ids)):
+            problems.append(f"{cid}:现象文件里切不到该用例")
+        if not (c.get("root_cause_file") or extract_section(rc_all, cid, ids)):
+            notes.append(f"{cid}:根因文件里没有,将跳过")
+        if not c.get("window"):
+            notes.append(f"{cid}:没填事故窗,推导角只能按题面里的时间取证")
+        k = fix_kind(c.get("fix"))
+        if k == "file" and not os.path.isfile(absp(c["fix"])):
+            problems.append(f"{cid}:修复 diff 文件不存在:{absp(c['fix'])}")
+        if k == "none":
+            notes.append(f"{cid}:没有修复来源,按 fix_diff: absent")
+    return problems, notes
 
 
 def run_batch(manifest_path, dry_run=False, force=False, only=None):
@@ -168,8 +244,16 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
         write(os.path.join(cdir, "prompt.txt"), ph)
         write(os.path.join(cdir, "root-cause.md"), rc)
         write(os.path.join(cdir, "window.txt"), (c.get("window") or "").strip() + "\n")
+        if c.get("spans"):
+            sp = absp(c["spans"])
+            if os.path.exists(sp) and os.path.isfile(SPAN_GRAPH):
+                import subprocess
+                r = subprocess.run([sys.executable, SPAN_GRAPH, sp, "--out", cdir], capture_output=True, text=True)
+                log(f"{cid}:正向图 " + ("✓" if r.returncode == 0 else "✗ " + r.stderr.strip()[-200:]))
+            else:
+                log(f"{cid}:⚠ span 文件或 span-graph skill 不在({sp}),跳过正向图")
         args = ["--phenomenon", os.path.join(cdir, "prompt.txt"), "--root-cause", os.path.join(cdir, "root-cause.md"),
-                "--out", cdir]
+                "--out", cdir, "--work", os.path.join(cdir, "work")]
         if c.get("window"):
             args += ["--window", c["window"]]
         if st.get("source"):
@@ -216,8 +300,18 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="只切好每个用例的输入、写汇总,不起模型")
     ap.add_argument("--force", action="store_true", help="已有产物也重跑")
     ap.add_argument("--only", help="只跑这些用例号,逗号分隔")
+    ap.add_argument("--check", action="store_true", help="只做自检:环境、batch.md、每个用例能否切到,不跑")
     a = ap.parse_args(argv)
-    run_batch(a.manifest, a.dry_run, a.force, set(a.only.split(",")) if a.only else None)
+    if a.check:
+        problems, notes = check(a.manifest)
+        for n in notes:
+            print("· " + n)
+        for p in problems:
+            print("✗ " + p)
+        print("自检:" + ("可以跑" if not problems else f"{len(problems)} 处要先修"))
+        sys.exit(1 if problems else 0)
+    rows = run_batch(a.manifest, a.dry_run, a.force, set(a.only.split(",")) if a.only else None)
+    sys.exit(1 if any(r["status"] == "failed" for r in rows) else 0)
 
 
 if __name__ == "__main__":

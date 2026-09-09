@@ -197,6 +197,7 @@ def main(argv=None):
     ap.add_argument("--config-dir", help="CLAUDE_CONFIG_DIR(选模型档)")
     ap.add_argument("--model", help="传给 claude --model")
     ap.add_argument("--force", action="store_true", help="已有产物也重跑")
+    ap.add_argument("--work", help="推导角的工作目录(缺省系统临时目录;批次会指到 输出目录/用例号/work 让日志留下)")
     a = ap.parse_args(argv)
 
     ph, gt, out, fix, source = resolve(a)
@@ -218,7 +219,7 @@ def main(argv=None):
         log("⚠ 没有源码树(--source / EVIDENCE_SOURCE_TREE),代码路径只能猜,verified 全为 false")
     if not a.window:
         log("⚠ 没有事故窗(--window),推导角只能按题面里的时间取证")
-    work = prepare_workdir(ph, gt, fix_text, source, window=a.window, ticket_url=ticket_url, ticket_text=ticket_text)
+    work = prepare_workdir(ph, gt, fix_text, source, work=a.work, window=a.window, ticket_url=ticket_url, ticket_text=ticket_text)
     claude_bin = find_claude()
     cfg = a.config_dir or os.environ.get("EVIDENCE_CONFIG_DIR") or None
     log(f"claude={claude_bin} · 模型档 {cfg or '<claude 默认>'} · 工作目录 {work}")
