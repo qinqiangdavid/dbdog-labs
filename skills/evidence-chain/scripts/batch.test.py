@@ -102,7 +102,8 @@ class Manifest(unittest.TestCase):
             import json
             js = json.load(open(os.path.join(d, "out", "batch-summary.json"), encoding="utf-8"))
             self.assertEqual([c["id"] for c in js["cases"]], ["DTS001", "DTS002", "DTS003"])
-            self.assertIn("--work", open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read())
+            dr = open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read()
+            self.assertIn(os.path.join("DTS001", "reverse", "work"), dr); self.assertIn("--out " + os.path.join(c1, "reverse"), dr)
 
     def test_diag_prompt_and_env(self):
         pr = b.build_diag_prompt("## OG-1 复现用例\n\n诊断: {{WINDOW}}(UTC+8),bench 库慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "【假设书写约定】...")
@@ -113,8 +114,8 @@ class Manifest(unittest.TestCase):
         self.assertIn("【假设书写约定】", pr)
         self.assertTrue(b.build_diag_prompt("bench 库慢", "", "R").startswith("诊断: bench 库慢"))
         env = b.diag_env({"PATH": "/bin"}, "/out/OG-1", "OG-1", "/cfg")
-        self.assertEqual(env["DBDOG_OBS_SPANS"], os.path.join("/out/OG-1", "spans.jsonl"))
-        self.assertEqual(env["DBDOG_OBS_DIR"], os.path.join("/out/OG-1", "obs-state"))
+        self.assertEqual(env["DBDOG_OBS_SPANS"], os.path.join("/out/OG-1", "forward", "spans.jsonl"))
+        self.assertEqual(env["DBDOG_OBS_DIR"], os.path.join("/out/OG-1", "forward", "obs-state"))
         self.assertEqual(env["DBDOG_OBS_TAGS"], "case_id=OG-1")
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg")
         deny = b.diag_settings("/out")["permissions"]["deny"]
@@ -127,12 +128,12 @@ class Manifest(unittest.TestCase):
             open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write(FILTER)
             open(os.path.join(d, "fix2.diff"), "w", encoding="utf-8").write("--- a\n+++ b\n")
             os.makedirs(os.path.join(d, "src"))
-            os.makedirs(os.path.join(d, "out", "DTS002")); open(os.path.join(d, "out", "DTS002", "spans.jsonl"), "w").write("{}\n")
+            os.makedirs(os.path.join(d, "out", "DTS002", "forward")); open(os.path.join(d, "out", "DTS002", "forward", "spans.jsonl"), "w").write("{}\n")
             mp = os.path.join(d, "batch.md"); open(mp, "w", encoding="utf-8").write(MANIFEST.format(d=d).replace("- 间隔分钟: 0", "- 间隔分钟: 0\n- 阶段: 诊断,正向,反向"))
             rows = {r["id"]: r for r in b.run_batch(mp, dry_run=True)}
             self.assertEqual(rows["DTS001"]["stages"], ["诊断", "正向", "反向"])
             self.assertEqual(rows["DTS002"]["stages"], ["正向", "反向"])   # 已有 spans.jsonl,不再诊断
-            open(os.path.join(d, "out", "DTS002", "evidence-chain.md"), "w").write("x")
+            os.makedirs(os.path.join(d, "out", "DTS002", "reverse")); open(os.path.join(d, "out", "DTS002", "reverse", "evidence-chain.md"), "w").write("x")
             rows = {r["id"]: r for r in b.run_batch(mp, dry_run=True)}
             self.assertEqual(rows["DTS002"]["stages"], ["正向"])   # 反向产物也在了,只剩正向(零模型,总是重出)
 

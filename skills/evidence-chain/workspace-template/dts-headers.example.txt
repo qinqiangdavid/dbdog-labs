@@ -1,0 +1,2 @@
+# 抓问题单页面用的请求头,每行 "Header: value";改名为 dts-headers.txt 并在 batch.md 里填「问题单请求头文件: dts-headers.txt」
+Cookie: <从浏览器复制>

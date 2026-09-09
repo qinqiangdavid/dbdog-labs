@@ -18,7 +18,7 @@ batch.md 格式(标题任意):
   - 用例号正则: 可选,缺省认 DTS 单号 / OG-数字 / 大写字母-数字
   | 用例 | 事故窗 | 修复 | 备注 |      表可省略:省略时用根因文件里出现的全部用例号;事故窗不填就从复现小节里解析;修复不填就按问题单模板拼
 可选列「现象文件」「根因文件」按行覆盖全局文件;「span 文件」指向已有的 spans.jsonl(不填则用 用例目录/spans.jsonl)。
-用例目录 = 各阶段的契约:prompt.txt / root-cause.md / window.txt → spans.jsonl(诊断) → forward-path.md(正向) → evidence-chain.md(反向)。
+用例目录 = 各阶段的契约:prompt.txt / root-cause.md / window.txt → forward/spans.jsonl(诊断) → forward/forward-path.md(正向) → reverse/evidence-chain.md(反向)。
 """
 import argparse
 import json
@@ -39,6 +39,7 @@ COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note"
 SPAN_GRAPH = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "scripts", "from_spans.py")
 RULES = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "references", "hypothesis-rules.txt")
 STAGES_DEFAULT = "正向,反向"
+FWD, REV = "forward", "reverse"   # 用例目录下正向 / 反向各一个子目录
 ID_PATTERN_DEFAULT = r"\b(?:DTS\d{6,}|OG-\d+|[A-Z]{2,}[-_]?\d{3,})\b"
 TS = r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?|\d{1,2}:\d{2}(?::\d{2})?"
 WINDOW_KEYS = r"复现时间|执行时间|事故窗|时间窗|发生时间|时间段|时间范围|窗口|window|时间"
@@ -170,8 +171,8 @@ def build_diag_prompt(phenomenon, window, rules_text):
 def diag_env(base, cdir, case_id, config_dir=None):
     """诊断会话的环境:span 直接落到用例目录,hook 状态也隔离到用例目录,span 打上 case_id 标签。"""
     env = dict(base)
-    env["DBDOG_OBS_SPANS"] = os.path.join(cdir, "spans.jsonl")
-    env["DBDOG_OBS_DIR"] = os.path.join(cdir, "obs-state")
+    env["DBDOG_OBS_SPANS"] = os.path.join(cdir, FWD, "spans.jsonl")
+    env["DBDOG_OBS_DIR"] = os.path.join(cdir, FWD, "obs-state")
     env["DBDOG_OBS_TAGS"] = f"case_id={case_id}"
     env["DBDOG_OBS_ML_APP"] = env.get("DBDOG_OBS_ML_APP") or "evidence-pipeline"
     if config_dir:
@@ -189,7 +190,7 @@ def diag_settings(out_dir):
 def diagnose(cid, cdir, phenomenon, window, st, absp):
     """阶段「诊断」:起一个带 hook + dbdog MCP 的 claude -p 跑正向诊断,span 落到 cdir/spans.jsonl。"""
     import shutil, subprocess
-    wd = os.path.join(cdir, "work-diag")
+    wd = os.path.join(cdir, FWD, "diag")
     os.makedirs(wd, exist_ok=True)
     rules = read(RULES) if os.path.isfile(RULES) else ""
     if not rules:
@@ -222,7 +223,8 @@ def forward(cid, cdir, spans_path):
     if not (os.path.isfile(spans_path) and os.path.isfile(SPAN_GRAPH)):
         log(f"{cid}:⚠ span 文件或 span-graph skill 不在({spans_path}),跳过正向图")
         return False
-    r = subprocess.run([sys.executable, SPAN_GRAPH, spans_path, "--out", cdir], capture_output=True, text=True)
+    os.makedirs(os.path.join(cdir, FWD), exist_ok=True)
+    r = subprocess.run([sys.executable, SPAN_GRAPH, spans_path, "--out", os.path.join(cdir, FWD)], capture_output=True, text=True)
     log(f"{cid}:正向图 " + ("✓" if r.returncode == 0 else "✗ " + r.stderr.strip()[-200:]))
     return r.returncode == 0
 
@@ -235,7 +237,7 @@ def summarize(out_dir, rows):
     status_zh = {"done": "完成", "dry_run": "只备好输入", "skipped_no_root_cause": "跳过:根因文件里没有该用例",
                  "skipped_no_phenomenon": "跳过:现象文件里没有该用例", "skipped_existing": "已有产物,跳过", "failed": "失败"}
     for r in rows:
-        js = os.path.join(out_dir, r["id"], "evidence-chain.json")
+        js = os.path.join(out_dir, r["id"], REV, "evidence-chain.json")
         verdict = ""; cnt = {"obtained_match": "", "obtained_mismatch": "", "empty_or_error": "", "no_tool": ""}; nf = ""
         if os.path.isfile(js):
             try:
@@ -248,11 +250,11 @@ def summarize(out_dir, rows):
                 nf = len(d.get("dbdog_findings") or [])
             except ValueError:
                 verdict = "json 不合法"
-        md = os.path.join(out_dir, r["id"], "evidence-chain.md")
-        fp = os.path.join(out_dir, r["id"], "forward-path.md")
+        md = os.path.join(out_dir, r["id"], REV, "evidence-chain.md")
+        fp = os.path.join(out_dir, r["id"], FWD, "forward-path.md")
         lines.append(f"| {r['id']} | {status_zh.get(r['status'], r['status'])}{(':' + r['detail']) if r.get('detail') else ''} | {verdict} | "
                      f"{cnt['obtained_match']} | {cnt['obtained_mismatch']} | {cnt['empty_or_error']} | {cnt['no_tool']} | {nf} | "
-                     f"{'evidence-chain.md' if os.path.isfile(md) else ''} | {'forward-path.md' if os.path.isfile(fp) else ''} |")
+                     f"{REV + '/evidence-chain.md' if os.path.isfile(md) else ''} | {FWD + '/forward-path.md' if os.path.isfile(fp) else ''} |")
         js_rows.append({"id": r["id"], "status": r["status"], "detail": r.get("detail", ""), "verdict": verdict,
                         "outcomes": {k: (v or 0) for k, v in cnt.items()}, "dbdog_findings": nf or 0,
                         "evidence_chain_md": md if os.path.isfile(md) else None, "forward_path_md": fp if os.path.isfile(fp) else None})
@@ -385,19 +387,19 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
         write(os.path.join(cdir, "root-cause.md"), rc)
         write(os.path.join(cdir, "window.txt"), (c.get("window") or "").strip() + "\n")
         stages = [x.strip() for x in re.split(r"[,，\s]+", st.get("stages") or STAGES_DEFAULT) if x.strip()]
-        spans_path = absp(c["spans"]) if c.get("spans") else os.path.join(cdir, "spans.jsonl")
+        spans_path = absp(c["spans"]) if c.get("spans") else os.path.join(cdir, FWD, "spans.jsonl")
         planned = []
         if "诊断" in stages and (force or not (os.path.isfile(spans_path) and os.path.getsize(spans_path) > 0)):
             planned.append("诊断")
         if "正向" in stages:
             planned.append("正向")
-        if "反向" in stages and (force or not os.path.isfile(os.path.join(cdir, "evidence-chain.md"))):
+        if "反向" in stages and (force or not os.path.isfile(os.path.join(cdir, REV, "evidence-chain.md"))):
             planned.append("反向")
         row["stages"] = planned
         if not planned:
             row["status"] = "skipped_existing"; log(f"{cid}:各阶段产物都在,跳过(--force 重跑)"); continue
         args = ["--phenomenon", os.path.join(cdir, "prompt.txt"), "--root-cause", os.path.join(cdir, "root-cause.md"),
-                "--out", cdir, "--work", os.path.join(cdir, "work")]
+                "--out", os.path.join(cdir, REV), "--work", os.path.join(cdir, REV, "work")]
         if c.get("window"):
             args += ["--window", c["window"]]
         if st.get("source"):
