@@ -26,6 +26,15 @@ python S/from_spans.py ~/.claude/dbdog-obs/spans.jsonl --trace <trace_id> --out 
 
 产物默认写在输入旁(目录形态写在该目录里):`forward-path.md` + `forward-path.json`。
 
+## 用户在会话里怎么说,你(Claude)怎么接
+
+- 「正向,span 文件在 <路径>\spans.jsonl,出假设图」→ 直接跑 `from_spans.py <路径>`,产物写在同目录;把 `forward-path.md` 的假设树部分贴给用户,并点出未声明的假设、没 [H..] 头的调用有几处。
+- 「正向,用 dbdog-obs 里最近一次诊断的 span,输出到 <单号目录>」→ 读 `~/.claude/dbdog-obs/spans.jsonl`(Windows `%USERPROFILE%\.claude\dbdog-obs\spans.jsonl`),取 ts 最新的 trace_id,跑 `from_spans.py <日志> --trace <id> --out <单号目录>`。
+- 同一会话里刚跑完「诊断:」再说「正向,把刚才这次的 span 出图,输出到 <单号目录>」→ 当前 trace_id 在 `~/.claude/dbdog-obs/<session_id>.json` 的 `trace_id` 字段(session_id 是本会话的),用它 `--trace`。
+- 用户给的是目录 → 直接传目录,脚本自己找里面的 spans.jsonl。
+
+不要自己解析 span 编树,也不要调模型总结;这个 skill 的产物就是脚本出的 markdown。
+
 ## 图怎么长
 
 `tags.hypothesis_id` / `parent_hypothesis_id` 优先,否则解析 intent 的 `[H2<H1] 类型=…; 假设=…; 判据=…; 关=…; 意图=…`(与 hook 的 hypothesis.mjs、语料仓的 build-hypotheses.py 同一套规则)。markdown 里有:
