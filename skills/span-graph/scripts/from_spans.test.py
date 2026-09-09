@@ -158,6 +158,26 @@ class FromSpans(unittest.TestCase):
         self.assertEqual((p["id"], p["parent"], p["text"]), ("H2.1", "H2", "扫描量对不上"))
         self.assertEqual(fs.parse_intent("[ H4.1 < H4 > ] 假设=x")["parent"], "H4")
 
+    def test_prose_closing(self):
+        spans = [
+            tool("t1", "get_dbdog_metric", 1, intent="[H1] 类型=现象确认; 假设=能锚定; 判据=有则成立"),
+            tool("t2", "get_dbdog_metric", 2, intent="[H2<H1] 类型=根因; 假设=计划错; 判据=全扫; 关=H1:证实"),
+            {"span_id": "root", "kind": "agent", "name": "claude-code.task", "trace_id": "aa", "ts": 9,
+             "output": "结论……\n\n## 假设收口\n\n- H1 证伪 —— 找不到实例\n- H2 未决 —— 缺计划\n- H3 证实 —— 源码核到\n\n## 别的\nH2 证实"},
+            {"span_id": "llm9", "kind": "llm", "name": "anthropic.messages", "trace_id": "aa", "ts": 8,
+             "output": "## 假设收口\n- H3 证实 —— 源码核到"},
+        ]
+        g = fs.build(spans)
+        by = {n["id"]: n for n in g["nodes"]}
+        self.assertEqual(by["H1"]["verdict"], "confirmed")   # 工具调用上的 关= 优先,正文不覆盖
+        self.assertEqual(by["H2"]["verdict"], "open")        # 正文说未决;小节外的「H2 证实」不算
+        self.assertEqual(by["H3"]["verdict"], "confirmed")
+        self.assertEqual(by["H3"]["closed_by"]["in"], "prose")
+        self.assertEqual(sum(1 for e in g["edges"] if e["kind"] == "resolve" and e["to"] == "H3"), 1)   # root 与末轮 llm 重复,只记一条
+        self.assertEqual(fs.scan_closing("无收口"), [])
+        md = fs.render_md(g)
+        self.assertIn("正文收口 → H3", md); self.assertIn("结论正文「假设收口」里关闭", md)
+
     def test_dir_resolves_spans_jsonl(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "spans.jsonl")

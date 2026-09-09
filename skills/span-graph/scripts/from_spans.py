@@ -23,6 +23,8 @@ VERDICT = {"证伪": "falsified", "证实": "confirmed", "未决": "open"}
 TYPE_ZH = {"confirm": "现象确认", "cause": "根因"}
 VERDICT_ZH = {"falsified": "证伪", "confirmed": "证实", "open": "未决"}
 PROPOSE = re.compile(rf"提出\s*\[\s*({ID})")                              # 正文里显式提出
+CLOSING_HEAD = re.compile(r"^\s*#{0,6}\s*\**\s*假设收口")                      # 结论末尾的「## 假设收口」小节
+CLOSING_LINE = re.compile(rf"^\s*[-*|]?\s*\**\s*({ID})\s*\**\s*[:：]?\s*(证伪|证实|未决)")
 PROTOCOL_RESTATE = re.compile(r"书写约定|telemetry\.intent|格式固定")       # 复述约定的行不算提出
 RESTATE_LINE = re.compile(r"示例|H<编号|假设=<|判据=<|\[H\d[^\]]*\]\s*假设=")   # 模板/示例行(占位符或示例编号)
 
@@ -124,6 +126,24 @@ def prose_fields(s):
     th = s.get("thinking_local")
     if isinstance(th, str) and th.strip():
         out.append(("thinking", th))
+    return out
+
+
+def scan_closing(text):
+    """结论正文「## 假设收口」小节里的「H1 证伪 —— 依据」→ [(hid, verdict)]。只认该小节之内、到下一个标题为止。"""
+    if not isinstance(text, str) or not text.strip():
+        return []
+    out, inside = [], False
+    for line in normalize(text).splitlines():
+        if CLOSING_HEAD.match(line):
+            inside = True
+            continue
+        if inside and re.match(r"^\s*#{1,6}\s", line):
+            break
+        if inside:
+            m = CLOSING_LINE.match(line)
+            if m:
+                out.append((m.group(1), VERDICT[m.group(2)]))
     return out
 
 
@@ -247,6 +267,15 @@ def build(spans):
                     if n["proposed_in"] is None:
                         n["proposed_in"] = {"span_id": s.get("span_id"), "in": source}
                         fill(n, pp)
+                # 正文收口:结论末尾「## 假设收口」小节;工具调用上的 关= 优先,正文只补没关过的
+                for hid, verdict in scan_closing(text):
+                    n = ensure(nodes, hid)
+                    if n["verdict"] == "open" or (n.get("closed_by") or {}).get("in") == "prose":
+                        n["verdict"] = verdict
+                        n["closed_by"] = {"from": "正文收口", "in": "prose", "span_id": s.get("span_id")}
+                        # 同一段结论会同时出现在 root span 与末轮 llm span 的 output 里,只记一条
+                        if not any(e["from"] == "正文收口" and e["to"] == hid and e["verdict"] == verdict for e in resolve_edges):
+                            resolve_edges.append({"kind": "resolve", "from": "正文收口", "to": hid, "verdict": verdict, "span_id": s.get("span_id")})
             continue
         seq += 1
         tool = (s.get("name") or "").replace("mcp__dbdog__", "")
@@ -344,7 +373,8 @@ def render_md(g):
         head = "#" * min(3 + depth, 6)
         title = f"{head} {n['id']} · {typ} · {ver}"
         if n.get("closed_by"):
-            title += f"(由 {n['closed_by']['from']} 在 seq {n['closed_by']['seq']} 关闭)"
+            cb = n["closed_by"]
+            title += f"(由 {cb['from']} 在 seq {cb['seq']} 关闭)" if cb.get("seq") else "(结论正文「假设收口」里关闭,工具调用上没写 关=)"
         lines.append(title)
         lines.append("")
         if n.get("proposed_in"):
