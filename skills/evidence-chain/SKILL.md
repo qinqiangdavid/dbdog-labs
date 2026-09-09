@@ -71,14 +71,10 @@ D:\pair\                       ← 工作区(各自一份或共享盘)
     ├── batch-summary.md       ← 给人看
     ├── batch-summary.json     ← 给调度/程序看
     └── <用例号>\
-        ├── prompt.txt         ← 阶段 0 切分:题面
-        ├── root-cause.md      ← 阶段 0:根因
-        ├── window.txt         ← 阶段 0:事故窗
-        ├── work\              ← 阶段 1 反向:推导角工作目录(claude.err / case.md / ticket.txt),失败看这
-        ├── evidence-chain.md  ← 阶段 1 产物(+ .json)
-        ├── spans.jsonl        ← 阶段 2 正向的输入:那次诊断的 hook span(人放进来,或 batch.md 的「span 文件」列指过来)
-        ├── forward-path.md    ← 阶段 2 产物(span-graph,零模型,batch 顺手生成)
-        └── compare.md         ← 阶段 3 对比(以后接在同一目录上)
+        ├── prompt.txt / root-cause.md / window.txt   阶段 0 切分
+        ├── forward\                                  正向:spans.jsonl · obs-state\ · diag\(诊断阶段)→ forward-path.md
+        ├── reverse\                                  反向:evidence-chain.md (+ .json) · work\(推导角日志)
+        └── compare\                                  阶段 3 对比(以后接在同一目录上)
 ```
 
 skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-graph\`(插件或 zip),工作区只放数据和产物。
@@ -90,9 +86,9 @@ skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-grap
 | 阶段 | 做什么 | 产物 | 跳过条件 |
 |---|---|---|---|
 | 切分 | 按用例号从两个大文件切出题面/根因,写事故窗 | prompt.txt / root-cause.md / window.txt | 总是重切 |
-| 诊断(可选) | 起一个带 hook + dbdog MCP 的正向诊断会话,题面拼上假设书写约定,`DBDOG_OBS_SPANS` 指到用例目录,对答案目录禁读 | spans.jsonl(+ work-diag/ 日志) | 已有 spans.jsonl |
-| 正向 | span-graph 零模型出图 | forward-path.md | 无 spans.jsonl |
-| 反向 | 本 skill 的推导角真取证 | evidence-chain.md(+ work/ 日志) | 已有 evidence-chain.md |
+| 诊断(可选) | 起一个带 hook + dbdog MCP 的正向诊断会话,题面拼上假设书写约定,`DBDOG_OBS_SPANS` 指到用例目录,对答案目录禁读 | forward/spans.jsonl(+ forward/diag/ 日志) | 已有 spans.jsonl |
+| 正向 | span-graph 零模型出图 | forward/forward-path.md | 无 spans.jsonl |
+| 反向 | 本 skill 的推导角真取证 | reverse/evidence-chain.md(+ reverse/work/ 日志) | 已有 evidence-chain.md |
 | 对比 | 以后接在同一目录上 | compare.md | — |
 
 「阶段」缺省 `正向,反向`(诊断由人另跑,见下);写 `诊断,正向,反向` 就全自动。幂等,重跑只补缺的阶段,有用例失败退出码为 1,可直接挂 Windows 计划任务 / cron 每晚跑,batch.md 新加的行自动被捡起来。诊断和反向都是 `claude -p`,各自十到三十分钟。
@@ -100,7 +96,7 @@ skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\` 与 `span-grap
 **诊断由人手跑时怎么把 span 落到用例目录**:开 Claude Code 之前设两个环境变量,再发「诊断: 题面」:
 
 ```bat
-set DBDOG_OBS_SPANS=D:\pair\out\OG-7601\spans.jsonl
+set DBDOG_OBS_SPANS=D:\pair\out\OG-7601\forward\spans.jsonl
 set DBDOG_OBS_TAGS=case_id=OG-7601
 claude
 ```
@@ -125,11 +121,11 @@ python S/batch.py batch.md               # 顺序跑,用例之间歇「间隔分
 python S/batch.py batch.md --only DTS001,DTS002 --force
 ```
 
-表里可选加一列「span 文件」,指向那次正向诊断的 spans.jsonl,批次会顺手用 span-graph 在同一用例目录里生成 `forward-path.md`(零模型)。
+表里可选加一列「span 文件」,指向那次正向诊断的 spans.jsonl,批次会顺手用 span-graph 在该用例的 `forward\` 下生成 `forward-path.md`(零模型)。
 
 修复来源那列三种都行:本地 diff 文件;GitHub/Gitee 的 PR 或 commit 链接(自动取 `.diff`);**问题单网页地址**(如 DTS 单,修复代码贴在页面里)——runner 先试着把页面抓成 `ticket.txt` 交给推导角,抓不到(要登录)就把地址交给推导角,放开 WebFetch 让它自己打开;都找不到修复代码就按 `fix_diff: absent`。
 
-产物:`输出目录\用例号\evidence-chain.md`(+ `.json`),以及 `输出目录atch-summary.md`,一行一个用例:状态、讲不讲得通的结论、四类取证计数、dbdog 侧发现条数。
+产物:`输出目录\用例号\reverse\evidence-chain.md`(+ `.json`;推导角日志在 `reverse\work\`),以及 `输出目录atch-summary.md`,一行一个用例:状态、讲不讲得通的结论、四类取证计数、dbdog 侧发现条数。
 
 ## 环境
 
@@ -151,4 +147,5 @@ run-batch.cmd / run-batch.sh           一键:先自检再跑
 scripts/check_chain.py                 产物校验(也可单独跑:python check_chain.py evidence-chain.json;打印四类取证结果计数)
 scripts/fetch-catalog.py               刷新工具目录
 scripts/run.test.py / batch.test.py    测试
+workspace-template/                    Windows 全自动工作区模板(run.cmd / schedule.cmd / batch.md / inputs / README)
 ```
