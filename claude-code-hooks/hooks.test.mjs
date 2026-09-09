@@ -1107,7 +1107,10 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
     for (const id of pending) expect(known.has(id)).toBe(true);
   });
 
-  it("re-sends spans carried over from a previous failed report", async () => {
+  it("Stop 不重发积压：旧 id 原样留在 pending，上报包只含本轮 span；积压由 sweep 补发", async () => {
+    // 2026-09-08：此前 Stop 把「全部积压 + 本轮新 span」一次发——积压越多包越大越发不成功，
+    // 慢链路上永远排不空（8 月 559 条从 08-12 卡到 09-08）。Stop 在 15s hook 超时的关键
+    // 路径上，只管本轮；积压交给不在交互路径上的 sweep 分批慢慢发。
     const dir = tempObsDir();
     const transcript = tinyTranscript(dir);
     seedState(dir, "p2", transcript);
@@ -1122,7 +1125,7 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
     const carried = readState(dir, "p2").pending_spans;
     expect(carried.length).toBeGreaterThan(0);
 
-    // 第二次：通了——上一轮攒下的 id 应被回捞成全文一起发出
+    // 第二次：通了——只发本轮新合成的 span（游标已推进，本轮只有 root 重发），积压原样保留
     const sink = await startSpanSink();
     try {
       await runHookAsync(
@@ -1131,11 +1134,46 @@ describe("pending 瘦身：状态文件只存 span_id", () => {
         dir,
         { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k" },
       );
+      const root = readState(dir, "p2").root_span_id;
+      expect(sink.received.map((s) => s.span_id)).toEqual([root]);
+      const stillPending = readState(dir, "p2").pending_spans;
+      for (const id of carried) if (id !== root) expect(stillPending, `${id} 应仍在 pending`).toContain(id);
+
+      // 积压由 sweep 补发（状态文件闲置超过 idle 后）
+      const p = path.join(dir, "p2.json");
+      ageFile(p, 3 * HOUR);
+      await runScript("sweep.mjs", dir, { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k", DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR) });
       const sent = new Set(sink.received.map((s) => s.span_id));
-      for (const id of carried) expect(sent.has(id), `${id} 应被补发`).toBe(true);
-      // 补发的是全文，不是光秃秃的 id
-      expect(sink.received.every((s) => typeof s === "object" && s.kind)).toBe(true);
+      for (const id of carried) expect(sent.has(id), `${id} 应由 sweep 补发`).toBe(true);
       expect(readState(dir, "p2").pending_spans).toEqual([]);
+    } finally {
+      await sink.close();
+    }
+  });
+
+  it("SessionEnd 同样只发本轮 span，积压留给随后触发的 sweep", async () => {
+    const dir = tempObsDir();
+    const transcript = tinyTranscript(dir);
+    seedState(dir, "p3", transcript, { pending_spans: ["stale1", "stale2"] });
+    fs.appendFileSync(
+      path.join(dir, "spans.jsonl"),
+      ["stale1", "stale2"].map((id) => JSON.stringify({ trace_id: "a".repeat(32), span_id: id, kind: "tool", name: "old" })).join("\n") + "\n",
+    );
+    const sink = await startSpanSink();
+    try {
+      await runHookAsync(
+        "session-end.mjs",
+        { session_id: "p3", transcript_path: transcript, hook_event_name: "SessionEnd", reason: "exit" },
+        dir,
+        { DBDOG_OBS_REPORT_URL: sink.url, DBDOG_OBS_API_KEY: "k", DBDOG_OBS_SWEEP_IDLE_MS: String(10 * DAY) },
+      );
+      const sent = sink.received.map((s) => s.span_id);
+      expect(sent).not.toContain("stale1");
+      expect(sent).not.toContain("stale2");
+      expect(sent.length).toBeGreaterThan(0);
+      const pending = readState(dir, "p3").pending_spans;
+      expect(pending).toContain("stale1");
+      expect(pending).toContain("stale2");
     } finally {
       await sink.close();
     }

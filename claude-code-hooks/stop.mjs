@@ -37,7 +37,6 @@ import {
   capField,
   run,
   deriveSpanId,
-  lookupSpans,
   pendingIds,
 } from "./lib.mjs";
 import { PENDING_TOOL_USE_MAX, msBetween, readNewLines, synthesize } from "./synthesize.mjs";
@@ -47,15 +46,17 @@ import { summaryEnv } from "./summary.mjs";
 const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-worker.mjs");
 
 /**
- * 落盘 + 上报；返回未成功送达的 **span_id 列表**（留待下次重试）。
- * 本地 JSONL 永远先落（真相源），所以 pending 只需记 id，用时回捞——
- * 存全文会把状态文件撑到数百 KB（实测 315 KB）。
+ * 落盘 + 上报本轮新 span；返回未成功送达的 **span_id 列表**（留待 sweep 补发）。
+ * 本地 JSONL 永远先落（真相源），所以 pending 只需记 id——存全文会把状态文件撑到
+ * 数百 KB（实测 315 KB）。
+ * 积压（carriedOverIds）原样带回、**不在这里重发**（2026-09-08）：Stop 在 15s hook
+ * 超时的交互路径上，此前「全部积压 + 本轮」一次发，积压越多包越大越发不成功，慢链路上
+ * 永远排不空（8 月 559 条从 08-12 卡到 09-08）。补发交给不在交互路径上的 sweep 分批做。
  */
 async function emit(spans, carriedOverIds) {
   appendSpans(spans);
-  const batch = [...lookupSpans(carriedOverIds), ...spans];
-  const reported = await reportSpans(batch);
-  return reported ? [] : batch.map((s) => s.span_id);
+  const reported = await reportSpans(spans);
+  return [...carriedOverIds, ...(reported ? [] : spans.map((s) => s.span_id))];
 }
 
 /**
