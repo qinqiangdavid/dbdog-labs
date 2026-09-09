@@ -447,6 +447,17 @@ def render_md(g):
     return "\n".join(lines)
 
 
+def agent_conclusion(spans):
+    """root agent span(kind=agent 且无 parent)的 output;多条取最长。没有 root 就退到最后一条 llm span 的 output。"""
+    roots = [s for s in spans if s.get("kind") == "agent" and not s.get("parent_id")]
+    texts = [s.get("output_local") or s.get("output") or "" for s in roots]
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if texts:
+        return max(texts, key=len)
+    llm = sorted((s for s in spans if s.get("kind") == "llm" and isinstance(s.get("output"), str) and s["output"].strip()), key=sort_key)
+    return llm[-1]["output"] if llm else ""
+
+
 def run(path, out=None, session=None, trace=None):
     src = resolve_input(path)
     spans = load_spans(src, session, trace)
@@ -463,6 +474,11 @@ def run(path, out=None, session=None, trace=None):
         f.write("\n")
     with open(mp, "w", encoding="utf-8") as f:
         f.write(render_md(g))
+    # agent 的最终回答(root agent span 的 output):对比时段对段要用,单独落一份
+    concl = agent_conclusion(spans)
+    if concl:
+        with open(os.path.join(out, "forward-conclusion.md"), "w", encoding="utf-8") as f:
+            f.write("# 被测 agent 的最终回答(root span output 原文)\n\n" + concl.strip() + "\n")
     s = g["summary"]
     print(f"forward-path: 假设 {s['hypotheses']} · 假设边 {s['parent_edges']} · 工具边 {s['tool_edges']} · "
           f"收口 {s['resolve_edges']} · 未挂 {s['unattached_tools']} → {mp}", file=sys.stderr)
