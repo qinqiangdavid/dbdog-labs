@@ -7,13 +7,13 @@ pair\
 ├── run.cmd                ← 双击/计划任务入口:先自检,再按 batch.md 顺序跑全部用例;日志在 logs\
 ├── schedule.cmd           ← 注册成每天 02:00 的 Windows 计划任务(跑一次即可;删任务:schtasks /delete /tn evidence-chain-nightly /f)
 ├── install-skills.cmd     ← 可选:把 skills\ 下两个 skill 复制到 %USERPROFILE%\.claude\skills,在 Claude Code 会话里也能用「反向取证」「正向」触发
-├── batch.md               ← 唯一要改的配置:五行路径 + 阶段
+├── batch.md               ← 唯一要改的配置:几行路径 + 阶段
 ├── inputs\
+│   ├── tickets.txt        ← 问题单文件:一行一个单号,后面可跟修复代码链接、事故窗
 │   ├── reproduce.md       ← 多用例复现文件(现象 + 复现时间),每个用例一个「## 单号」小节
-│   ├── filter.md          ← 多用例根因文件,每个用例一个「## 单号」小节;这里有的用例才跑
+│   ├── filter.md          ← 多用例根因文件,每个用例一个「## 单号」小节;这里没有的单号跳过
 │   └── fixes\             ← 有本地 diff 就放这
 ├── mcp.json               ← dbdog MCP 配置(从 mcp.example.json 改;诊断和反向都用它)
-├── dts-headers.txt        ← 可选:问题单页面要登录时放 Cookie(从 dts-headers.example.txt 改;别外传)
 ├── skills\
 │   ├── evidence-chain\    ← 反向取证 skill(batch.py 在 scripts\ 下)
 │   └── span-graph\        ← span 转假设图 skill
@@ -24,7 +24,7 @@ pair\
 
 1. 装好 Python 3.8+ 和 Claude Code CLI(`python`、`claude` 在 PATH)。
 2. Claude Code 里装好 dbdog-obs hook(插件 `dbdog-agent-obs`),并在 `settings.json` 的 env 里配 `DBDOG_OBS_REPORT_URL` / `DBDOG_OBS_API_KEY`。没有 hook 就没有 span,正向图会是空的。
-3. 把复现文件、根因文件放进 `inputs\`;改 `batch.md` 里的源码树路径和问题单地址模板;`mcp.example.json` 改成 `mcp.json` 填上地址和鉴权。
+3. 把问题单文件、复现文件、根因文件放进 `inputs\`;改 `batch.md` 里的源码树路径;`mcp.example.json` 改成 `mcp.json` 填上地址和鉴权。
 4. 跑 `run.cmd`。它先自检(Python、claude、MCP 连通、源码树、每个用例能否切到、复现时间抓到什么),红的按提示修;通过就顺序跑。
 5. 看 `out\batch-summary.md`。
 
@@ -44,9 +44,16 @@ out\<单号>\
 
 之后做「对比」时,把 forward\forward-path.md 和 reverse\evidence-chain.md 一起交给强模型,结果放 compare\。
 
-## 复现文件与根因文件的格式
+## 三个输入文件的格式
 
-按单号切小节,标题行含单号即可:
+`tickets.txt` 一行一个单号,后面可跟修复代码链接(commit / PR / 本地 diff)和事故窗,空格或 | 分开,都可省:
+
+```
+DTS2026090100123  https://codehub.example.com/r/commit/abc123  2026-09-09 09:04:00 ~ 2026-09-09 09:07:00
+DTS2026090100456  https://gitee.com/opengauss/openGauss-server/pulls/8080
+```
+
+复现文件、根因文件按单号切小节,标题行含单号即可:
 
 ```markdown
 ## DTS2026090100123 慢查询

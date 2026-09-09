@@ -33,6 +33,7 @@ KEYS = {
     "间隔分钟": "interval_min", "模型": "model", "模型档": "config_dir", "MCP配置": "mcp_config", "mcp配置": "mcp_config",
     "阶段": "stages", "诊断模型档": "diag_config_dir", "诊断MCP配置": "diag_mcp_config", "诊断mcp配置": "diag_mcp_config",
     "问题单地址模板": "ticket_template", "问题单请求头文件": "ticket_headers_file", "用例号正则": "id_pattern",
+    "问题单文件": "tickets_file", "单号文件": "tickets_file",
 }
 COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note", "现象文件": "phenomenon_file", "根因文件": "root_cause_file",
         "span文件": "spans", "span 文件": "spans", "spans": "spans"}
@@ -84,6 +85,33 @@ def parse_manifest(text):
     except ValueError:
         settings["interval_min"] = 5.0
     return {"settings": settings, "cases": cases}
+
+
+def parse_tickets(text):
+    """问题单文件:一行一个单号,后面可跟修复代码链接(http… 或 本地 diff 路径)和事故窗,用 | 、制表符或空格分开;
+    # 开头是注释;markdown 表格行也认(第一列单号)。→ [{"id","fix","window"}]"""
+    cases = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or re.match(r"^\|?\s*:?-+", line):
+            continue
+        if "|" in line:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+        elif "\t" in line:
+            cells = [c.strip() for c in line.split("\t")]
+        else:
+            cells = line.split()
+        cells = [c for c in cells if c]
+        if not cells or cells[0] in ("用例", "单号", "问题单"):
+            continue
+        cid, fix, win = cells[0], "", []
+        for c in cells[1:]:
+            if not fix and (re.match(r"^https?://", c) or re.search(r"\.(diff|patch)$", c) or re.match(r"^[A-Za-z]:\\|^[./~]", c)):
+                fix = c
+            else:
+                win.append(c)
+        cases.append({"id": cid, "fix": fix, "window": " ".join(win).strip(), "note": "", "phenomenon_file": "", "root_cause_file": "", "spans": ""})
+    return cases
 
 
 def discover_ids(text, pattern=ID_PATTERN_DEFAULT):
@@ -315,9 +343,16 @@ def check(manifest_path):
         problems.append(f"span-graph skill 不在:{SPAN_GRAPH}(正向图要它)")
     ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") and os.path.isfile(absp(st["phenomenon_file"])) else ""
     rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") and os.path.isfile(absp(st["root_cause_file"])) else ""
+    if st.get("tickets_file"):
+        tf = absp(st["tickets_file"])
+        if not os.path.isfile(tf):
+            problems.append(f"问题单文件不存在:{tf}")
+        else:
+            cases = parse_tickets(read(tf))
+            notes.append(f"问题单文件:{len(cases)} 个单号,{sum(1 for c in cases if c['fix'])} 个带修复链接,{sum(1 for c in cases if c['window'])} 个带事故窗")
     if not cases:
         cases = [{"id": i} for i in discover_ids(rc_all or ph_all, st.get("id_pattern") or ID_PATTERN_DEFAULT)]
-        notes.append(f"用例表未填,从{'根因' if rc_all else '现象'}文件发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases) or '无'}")
+        notes.append(f"没有问题单文件也没有用例表,从{'根因' if rc_all else '现象'}文件发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases) or '无'}")
         if not cases:
             problems.append("既没有用例表,也没能从文件里发现用例号(可用「用例号正则」指定)")
     if st.get("ticket_template"):
@@ -356,10 +391,21 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
     os.makedirs(out_dir, exist_ok=True)
     ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") else ""
     rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") else ""
+    if st.get("tickets_file"):
+        tk = parse_tickets(read(absp(st["tickets_file"])))
+        over = {c["id"]: c for c in cases}
+        for t in tk:   # batch.md 表里同单号的行可覆盖问题单文件
+            o = over.get(t["id"])
+            if o:
+                for k in ("fix", "window", "spans", "phenomenon_file", "root_cause_file", "note"):
+                    if o.get(k):
+                        t[k] = o[k]
+        cases = tk
+        log(f"问题单文件 {st['tickets_file']}:{len(cases)} 个单号")
     if not cases:
         cases = [{"id": i, "window": "", "fix": "", "note": "", "phenomenon_file": "", "root_cause_file": "", "spans": ""}
                  for i in discover_ids(rc_all or ph_all, st.get("id_pattern") or ID_PATTERN_DEFAULT)]
-        log(f"batch.md 没有用例表,从{'根因' if rc_all else '现象'}文件里发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases)}")
+        log(f"没有问题单文件也没有用例表,从{'根因' if rc_all else '现象'}文件里发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases)}")
     ids = [c["id"] for c in cases]
     if only:
         cases = [c for c in cases if c["id"] in only]

@@ -165,6 +165,35 @@ class Manifest(unittest.TestCase):
             self.assertIn("--window 2026-09-09 09:04 ~ 09:07", dr)
             self.assertNotIn("复现时间", open(os.path.join(d, "out", "DTS001", "prompt.txt"), encoding="utf-8").read().split("诊断:")[0][:0])
 
+    def test_tickets_file(self):
+        txt = ("# 单号  修复链接  事故窗\n"
+               "DTS2026090100123 https://codehub.example.com/r/commit/abc123 2026-09-09 09:04–09:07 (UTC+8)\n"
+               "DTS2026090100456\thttps://gitee.com/o/r/pulls/9\n"
+               "DTS2026090100789 | D:\\fixes\\789.diff | 2026-09-09 11:00–11:03 |\n"
+               "| 单号 | 修复 |\n|---|---|\n| DTS2026090100999 | |\n"
+               "OG-7601\n")
+        t = b.parse_tickets(txt)
+        self.assertEqual([c["id"] for c in t], ["DTS2026090100123", "DTS2026090100456", "DTS2026090100789", "DTS2026090100999", "OG-7601"])
+        self.assertEqual(t[0]["fix"], "https://codehub.example.com/r/commit/abc123"); self.assertEqual(t[0]["window"], "2026-09-09 09:04–09:07 (UTC+8)")
+        self.assertEqual(t[1]["fix"], "https://gitee.com/o/r/pulls/9"); self.assertEqual(t[1]["window"], "")
+        self.assertEqual(t[2]["fix"], "D:\\fixes\\789.diff"); self.assertEqual(t[2]["window"], "2026-09-09 11:00–11:03")
+        self.assertEqual(t[4]["fix"], "")
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write("## DTS001\n复现时间: 2026-09-09 09:04 ~ 09:07\n诊断: 慢\n\n## DTS002\n诊断: 卡\n")
+            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write("## DTS001\n提升\n\n## DTS002\n锁\n")
+            open(os.path.join(d, "tickets.txt"), "w", encoding="utf-8").write("DTS001 https://x/commit/1\nDTS002 https://x/commit/2 2026-09-09 10:00–10:03\n")
+            os.makedirs(os.path.join(d, "src"))
+            mp = os.path.join(d, "batch.md")
+            open(mp, "w", encoding="utf-8").write("- 问题单文件: tickets.txt\n- 现象文件: reproduce.md\n- 根因文件: filter.md\n- 源码树: src\n- 输出目录: out\n- 间隔分钟: 0\n")
+            problems, notes = b.check(mp)
+            self.assertEqual(problems, [], problems)
+            rows = b.run_batch(mp, dry_run=True)
+            self.assertEqual([r["id"] for r in rows], ["DTS001", "DTS002"])
+            d1 = open(os.path.join(d, "out", "DTS001", "dry-run.txt"), encoding="utf-8").read()
+            self.assertIn("--fix https://x/commit/1", d1); self.assertIn("--window 2026-09-09 09:04 ~ 09:07", d1)
+            d2 = open(os.path.join(d, "out", "DTS002", "dry-run.txt"), encoding="utf-8").read()
+            self.assertIn("--window 2026-09-09 10:00–10:03", d2)
+
     def test_check(self):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)
