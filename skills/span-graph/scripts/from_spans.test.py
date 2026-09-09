@@ -178,6 +178,13 @@ class FromSpans(unittest.TestCase):
         md = fs.render_md(g)
         self.assertIn("正文收口 → H3", md); self.assertIn("结论正文「假设收口」里关闭", md)
 
+    def test_agent_conclusion(self):
+        spans = [{"span_id": "r", "kind": "agent", "name": "claude-code.task", "trace_id": "aa", "ts": 1, "output": "## 结论\n五段式……"},
+                 {"span_id": "l", "kind": "llm", "trace_id": "aa", "ts": 2, "output": "中间"}]
+        self.assertEqual(fs.agent_conclusion(spans), "## 结论\n五段式……")
+        self.assertEqual(fs.agent_conclusion([spans[1]]), "中间")
+        self.assertEqual(fs.agent_conclusion([]), "")
+
     def test_dir_resolves_spans_jsonl(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "spans.jsonl")
