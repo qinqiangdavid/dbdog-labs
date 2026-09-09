@@ -80,6 +80,19 @@ skill 本身装在 `%USERPROFILE%\.claude\skills\evidence-chain\`(插件或 zip)
 
 **同事上手三步**:① 复制 `batch.example.md` 成 `batch.md`,改四个路径;② 跑 `run-batch.cmd batch.md`(mac/Linux 用 `run-batch.sh`),它先自检——Python、`claude`、MCP 连通、文件在不在、每个单号能否切到、抓到的事故窗和修复链接——红的按提示修;③ 看 `out\batch-summary.md`。幂等:已有产物的单号跳过,新加的单号下次自动被捡起来;有单号失败退出码为 1,可挂 Windows 计划任务 / cron。
 
+## 用户在会话里怎么说,你(Claude)怎么接
+
+用户给的是**两个大文件**(复现文件、根因文件)加源码树和输出目录时,按这个顺序做,不要一个单号一个单号手工拼:
+
+1. 在输出目录旁写一份 `batch.md`(四行:复现文件 / 根因文件 / 源码树 / 输出目录;用户提了 MCP 配置、模型档、只跑哪些单号就加上)。
+2. 先跑 `python S/batch.py batch.md --check`,把它打印的「每个单号切到的事故窗、修复链接、缺根因的单号」原样贴给用户核一眼;有 ✗ 就停下来让用户修。
+3. 用户说继续(或一开始就说了「直接跑」「放后台」),把 `python S/batch.py batch.md` 放到**后台**跑(每个单号十分钟量级、顺序、中间歇几分钟,不要前台等),告诉用户日志和产物在哪,然后可以继续接别的活。
+4. 跑完把 `out\batch-summary.md` 贴出来,指出哪些单号 partial / contradicted、哪些有 dbdog 侧发现,建议先看哪份 `evidence-chain.md`。
+
+用户只给一个单号的材料(题面 + 根因 + 窗 + 可选 diff)时,走单用例 `run.py`,不必写 batch.md。
+
+示例说法:「反向取证。复现文件 D:\pair\inputs\reproduce.md,根因文件 D:\pair\inputs\filter.md,源码树 D:\repo\opengauss-server,输出到 D:\pair\out。全部单号顺序跑,放后台,跑完把 batch-summary.md 贴给我。」
+
 ## 批量:一次给全量单号,顺序跑
 
 写一份 `batch.md`(模板见 `batch.example.md`),四行必填:复现文件、根因文件、源码树、输出目录;可选:间隔分钟(缺省 5)、MCP配置、模型档、模型、问题单文件、用例号正则。runner 自己组装每个单号:
