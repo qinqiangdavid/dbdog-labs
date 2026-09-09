@@ -136,6 +136,34 @@ class Manifest(unittest.TestCase):
             rows = {r["id"]: r for r in b.run_batch(mp, dry_run=True)}
             self.assertEqual(rows["DTS002"]["stages"], ["正向"])   # 反向产物也在了,只剩正向(零模型,总是重出)
 
+    def test_discover_ids_and_window(self):
+        rc = "# 根因集\n\n## DTS2026090100123 慢\n根因 A\n\n## DTS2026090100456\n根因 B\n\n## OG-7601\n根因 C\n"
+        self.assertEqual(b.discover_ids(rc), ["DTS2026090100123", "DTS2026090100456", "OG-7601"])
+        self.assertEqual(b.discover_ids(rc, r"DTS\d+"), ["DTS2026090100123", "DTS2026090100456"])
+        self.assertEqual(b.extract_window("## X\n现象:慢\n复现时间:2026-09-09 09:04:00 ~ 2026-09-09 09:07:00\n步骤..."), "2026-09-09 09:04:00 ~ 2026-09-09 09:07:00")
+        self.assertEqual(b.extract_window("- 执行时间窗: 2026/09/09 09:04–09:07 (UTC+8)"), "2026/09/09 09:04–09:07 (UTC+8)")
+        self.assertEqual(b.extract_window("| 时间 | 2026-09-09 09:04 |\n"), "2026-09-09 09:04")
+        self.assertEqual(b.extract_window("在 2026-09-09 09:04 到 09:07 之间变慢"), "在 2026-09-09 09:04 到 09:07 之间变慢")
+        self.assertEqual(b.extract_window("没有时间的现象"), "")
+
+    def test_no_table_uses_root_cause_ids_and_ticket_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(
+                "# 复现\n\n## DTS001 慢查询\n复现时间:2026-09-09 09:04 ~ 09:07\n诊断: bench 库 t0 t1 慢\n\n## DTS002 锁\n复现时间:2026-09-09 10:00 ~ 10:03\n诊断: 卡住\n")
+            open(os.path.join(d, "filter.md"), "w", encoding="utf-8").write("# 根因\n\n## DTS002\n锁\n\n## DTS001\n提升\n")
+            os.makedirs(os.path.join(d, "src"))
+            mp = os.path.join(d, "batch.md")
+            open(mp, "w", encoding="utf-8").write(f"- 现象文件: reproduce.md\n- 根因文件: filter.md\n- 源码树: src\n- 输出目录: out\n- 间隔分钟: 0\n- 问题单地址模板: https://dts.example.com/issue/{{id}}\n- 用例号正则: DTS\\d+\n")
+            problems, notes = b.check(mp)
+            self.assertEqual(problems, [], problems)
+            self.assertTrue(any("发现 2 个用例:DTS002, DTS001" in n for n in notes), notes)
+            rows = b.run_batch(mp, dry_run=True)
+            self.assertEqual([r["id"] for r in rows], ["DTS002", "DTS001"])
+            dr = open(os.path.join(d, "out", "DTS001", "dry-run.txt"), encoding="utf-8").read()
+            self.assertIn("--fix https://dts.example.com/issue/DTS001", dr)
+            self.assertIn("--window 2026-09-09 09:04 ~ 09:07", dr)
+            self.assertNotIn("复现时间", open(os.path.join(d, "out", "DTS001", "prompt.txt"), encoding="utf-8").read().split("诊断:")[0][:0])
+
     def test_check(self):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "reproduce.md"), "w", encoding="utf-8").write(REPRO)

@@ -13,7 +13,10 @@ batch.md 格式(标题任意):
   - 模型 / 模型档 / MCP配置: 可选,透传给 run.py 的 --model / --config-dir / --mcp-config
   - 阶段: 缺省「正向,反向」;写「诊断,正向,反向」则先起正向诊断会话(带 hook,span 落到用例目录)再出图再反向
   - 诊断模型档 / 诊断MCP配置: 诊断会话用的模型档与 MCP(缺省同上面的)
-  | 用例 | 事故窗 | 修复 | 备注 |      修复列:DTS 单地址 / PR 地址 / 本地 diff,可空
+  - 问题单地址模板: 如 https://dts.example.com/issue/{id},按用例号拼出问题单网页,skill 去页面里找修复代码/代码链接
+  - 问题单请求头文件: 可选,每行 "Header: value"(如 Cookie),抓需要登录的问题单页面用
+  - 用例号正则: 可选,缺省认 DTS 单号 / OG-数字 / 大写字母-数字
+  | 用例 | 事故窗 | 修复 | 备注 |      表可省略:省略时用根因文件里出现的全部用例号;事故窗不填就从复现小节里解析;修复不填就按问题单模板拼
 可选列「现象文件」「根因文件」按行覆盖全局文件;「span 文件」指向已有的 spans.jsonl(不填则用 用例目录/spans.jsonl)。
 用例目录 = 各阶段的契约:prompt.txt / root-cause.md / window.txt → spans.jsonl(诊断) → forward-path.md(正向) → evidence-chain.md(反向)。
 """
@@ -29,12 +32,16 @@ KEYS = {
     "现象文件": "phenomenon_file", "根因文件": "root_cause_file", "源码树": "source", "输出目录": "out",
     "间隔分钟": "interval_min", "模型": "model", "模型档": "config_dir", "MCP配置": "mcp_config", "mcp配置": "mcp_config",
     "阶段": "stages", "诊断模型档": "diag_config_dir", "诊断MCP配置": "diag_mcp_config", "诊断mcp配置": "diag_mcp_config",
+    "问题单地址模板": "ticket_template", "问题单请求头文件": "ticket_headers_file", "用例号正则": "id_pattern",
 }
 COLS = {"用例": "id", "事故窗": "window", "修复": "fix", "备注": "note", "现象文件": "phenomenon_file", "根因文件": "root_cause_file",
         "span文件": "spans", "span 文件": "spans", "spans": "spans"}
 SPAN_GRAPH = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "scripts", "from_spans.py")
 RULES = os.path.join(os.path.dirname(os.path.dirname(HERE)), "span-graph", "references", "hypothesis-rules.txt")
 STAGES_DEFAULT = "正向,反向"
+ID_PATTERN_DEFAULT = r"\b(?:DTS\d{6,}|OG-\d+|[A-Z]{2,}[-_]?\d{3,})\b"
+TS = r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?|\d{1,2}:\d{2}(?::\d{2})?"
+WINDOW_KEYS = r"复现时间|执行时间|事故窗|时间窗|发生时间|时间段|时间范围|窗口|window|时间"
 
 
 def log(msg):
@@ -76,6 +83,33 @@ def parse_manifest(text):
     except ValueError:
         settings["interval_min"] = 5.0
     return {"settings": settings, "cases": cases}
+
+
+def discover_ids(text, pattern=ID_PATTERN_DEFAULT):
+    """从多用例文件的标题行里收集用例号(按出现顺序去重);没有标题行就扫全文。"""
+    rx = re.compile(pattern)
+    ids, seen = [], set()
+    heads = [l for l in text.splitlines() if re.match(r"^#+\s", l)]
+    for line in heads or text.splitlines():
+        for m in rx.findall(line):
+            if m not in seen:
+                seen.add(m); ids.append(m)
+    return ids
+
+
+def extract_window(section):
+    """从复现小节里找复现时间:优先带时间关键词的行,其次一行里有两个时间戳的行。找不到返回 ''。"""
+    ts = re.compile(TS)
+    cand = None
+    for line in section.splitlines():
+        if re.match(r"^#+\s", line):
+            continue
+        if re.search(WINDOW_KEYS, line, re.I) and ts.search(line):
+            v = re.sub(r"^[\s\-*|]*(?:" + WINDOW_KEYS + r")[^:：\d]{0,6}[:：]?\s*", "", line, flags=re.I).strip(" |")
+            return v or line.strip()
+        if cand is None and len(ts.findall(line)) >= 2:
+            cand = line.strip(" |-*")
+    return cand or ""
 
 
 def extract_section(text, case_id, all_ids):
@@ -242,8 +276,6 @@ def check(manifest_path):
     base = os.path.dirname(os.path.abspath(manifest_path))
     def absp(p):
         return os.path.abspath(os.path.join(base, p)) if p and not os.path.isabs(p) else p
-    if not cases:
-        problems.append("batch.md 里没有用例表(| 用例 | 事故窗 | 修复 | 备注 |)")
     for k, zh in (("phenomenon_file", "现象文件"), ("root_cause_file", "根因文件")):
         if not st.get(k):
             notes.append(f"{zh}:未配置,每行要自带「{zh}」列")
@@ -281,15 +313,29 @@ def check(manifest_path):
         problems.append(f"span-graph skill 不在:{SPAN_GRAPH}(正向图要它)")
     ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") and os.path.isfile(absp(st["phenomenon_file"])) else ""
     rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") and os.path.isfile(absp(st["root_cause_file"])) else ""
+    if not cases:
+        cases = [{"id": i} for i in discover_ids(rc_all or ph_all, st.get("id_pattern") or ID_PATTERN_DEFAULT)]
+        notes.append(f"用例表未填,从{'根因' if rc_all else '现象'}文件发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases) or '无'}")
+        if not cases:
+            problems.append("既没有用例表,也没能从文件里发现用例号(可用「用例号正则」指定)")
+    if st.get("ticket_template"):
+        notes.append(f"问题单地址模板:{st['ticket_template']}" + ("" if "{id}" in st["ticket_template"] else " ← 缺 {id} 占位!"))
+        if "{id}" not in st["ticket_template"]:
+            problems.append("问题单地址模板里要有 {id} 占位")
+    if st.get("ticket_headers_file") and not os.path.isfile(absp(st["ticket_headers_file"])):
+        problems.append(f"问题单请求头文件不存在:{absp(st['ticket_headers_file'])}")
     ids = [c["id"] for c in cases]
     for c in cases:
         cid = c["id"]
-        if not (c.get("phenomenon_file") or extract_section(ph_all, cid, ids)):
+        sec = extract_section(ph_all, cid, ids) if not c.get("phenomenon_file") else read(absp(c["phenomenon_file"]))
+        if not sec:
             problems.append(f"{cid}:现象文件里切不到该用例")
         if not (c.get("root_cause_file") or extract_section(rc_all, cid, ids)):
             notes.append(f"{cid}:根因文件里没有,将跳过")
-        if not c.get("window"):
-            notes.append(f"{cid}:没填事故窗,推导角只能按题面里的时间取证")
+        win = c.get("window") or (extract_window(sec) if sec else "")
+        notes.append(f"{cid}:事故窗 " + (f"「{win}」" if win else "没抓到 ← 复现小节里要有带时间的行(复现时间/执行时间/时间窗…)"))
+        if not c.get("fix") and st.get("ticket_template"):
+            c["fix"] = st["ticket_template"].replace("{id}", cid)
         k = fix_kind(c.get("fix"))
         if k == "file" and not os.path.isfile(absp(c["fix"])):
             problems.append(f"{cid}:修复 diff 文件不存在:{absp(c['fix'])}")
@@ -308,6 +354,10 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
     os.makedirs(out_dir, exist_ok=True)
     ph_all = read(absp(st["phenomenon_file"])) if st.get("phenomenon_file") else ""
     rc_all = read(absp(st["root_cause_file"])) if st.get("root_cause_file") else ""
+    if not cases:
+        cases = [{"id": i, "window": "", "fix": "", "note": "", "phenomenon_file": "", "root_cause_file": "", "spans": ""}
+                 for i in discover_ids(rc_all or ph_all, st.get("id_pattern") or ID_PATTERN_DEFAULT)]
+        log(f"batch.md 没有用例表,从{'根因' if rc_all else '现象'}文件里发现 {len(cases)} 个用例:{', '.join(c['id'] for c in cases)}")
     ids = [c["id"] for c in cases]
     if only:
         cases = [c for c in cases if c["id"] in only]
@@ -326,6 +376,11 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
         rc = read(absp(c["root_cause_file"])) if c.get("root_cause_file") else extract_section(rc_all, cid, ids)
         if not rc:
             row["status"] = "skipped_no_root_cause"; log(f"{cid}:根因文件里没找到该用例,跳过"); continue
+        if not c.get("window"):
+            c["window"] = extract_window(ph)
+            log(f"{cid}:复现时间 " + (f"← 现象文件「{c['window']}」" if c["window"] else "没抓到(推导角只能按题面里的时间取证)"))
+        if not c.get("fix") and st.get("ticket_template"):
+            c["fix"] = st["ticket_template"].replace("{id}", cid)
         write(os.path.join(cdir, "prompt.txt"), ph)
         write(os.path.join(cdir, "root-cause.md"), rc)
         write(os.path.join(cdir, "window.txt"), (c.get("window") or "").strip() + "\n")
@@ -352,7 +407,8 @@ def run_batch(manifest_path, dry_run=False, force=False, only=None):
             args += ["--fix", absp(c["fix"])]
         elif kind in ("diff_url", "ticket"):
             args += ["--fix", c["fix"]]
-        for k, flag in (("model", "--model"), ("config_dir", "--config-dir"), ("mcp_config", "--mcp-config")):
+        for k, flag in (("model", "--model"), ("config_dir", "--config-dir"), ("mcp_config", "--mcp-config"),
+                        ("ticket_headers_file", "--ticket-headers")):
             if st.get(k):
                 args += [flag, absp(st[k]) if k != "model" else st[k]]
         if force:

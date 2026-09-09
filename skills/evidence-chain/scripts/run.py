@@ -44,10 +44,11 @@ def write(path, text):
 def case_md(phenomenon_file, root_cause_file, window=None, ticket_url=None, ticket_text=None):
     out = ["# 反向输入", ""]
     if ticket_url:
-        out += ["## 修复来源(问题单)", "", f"修复代码在这个问题单网页里:{ticket_url}",
+        out += ["## 修复来源(问题单)", "", f"修复代码在这个问题单网页里(或页面里给的 commit / PR 链接指向的代码):{ticket_url}",
                 ("其正文已抓成 `ticket.txt` 放在当前目录,先读它找修复代码/补丁;" if ticket_text else
                  "本机抓不到该页面(可能要登录),请用 WebFetch 打开这个地址读修复代码/补丁;"),
-                "找不到修复代码就按 `fix_diff: absent` 处理。", ""]
+                "页面里若只给了指向代码的链接(commit / PR / MR / gerrit),沿链接用 WebFetch 把 diff 取下来;",
+                "当前目录已有 `fix.diff` 就直接用它;都找不到修复代码就按 `fix_diff: absent` 处理。", ""]
     if window:
         out += ["## 事故窗(用例执行时间,取证一律用这个窗)", "", window.strip(), ""]
     out += ["## 现象(喂给被测 agent 的题面原话,即「诊断:」后面跟的那段)", "", read(phenomenon_file).strip(), ""]
@@ -90,15 +91,60 @@ def is_ticket_url(fix):
         and not re.search(r"(github\.com|gitee\.com)/[^/]+/[^/]+/(pull|pulls|commit)/", fix)
 
 
-def load_ticket(url):
-    """问题单网页(如 DTS):能下载就转成文本;下载不了(要登录)返回 None,由推导角自己打开。"""
+CODE_LINK = re.compile(r"""href=["']([^"']+?(?:/commit/|/commits/|/pull/|/pulls/|/merge_requests/|/changes/|/compare/|\.diff|\.patch)[^"']*)["']""", re.I)
+
+
+def load_headers(path):
+    h = {"User-Agent": "evidence-chain"}
+    if path and os.path.isfile(path):
+        for line in read(path).splitlines():
+            if ":" in line and not line.strip().startswith("#"):
+                k, v = line.split(":", 1)
+                h[k.strip()] = v.strip()
+    return h
+
+
+def fetch(url, headers, timeout=30):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def find_code_links(html, base_url=""):
+    """问题单页面里指向代码的链接(commit / PR / MR / gerrit change / .diff / .patch),去重保序。"""
+    from urllib.parse import urljoin
+    out, seen = [], set()
+    for m in CODE_LINK.findall(html):
+        u = urljoin(base_url, m.replace("&amp;", "&"))
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+
+def load_ticket(url, headers_file=None):
+    """问题单网页(如 DTS):能下载就转成文本,并顺着页面里的代码链接把 diff 扒下来。
+    返回 (页面文本或 None, diff 文本或 None, 代码链接列表)。下载不了(要登录)→ (None, None, []),由推导角自己打开。"""
+    headers = load_headers(headers_file)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "evidence-chain"}), timeout=30) as r:
-            body = r.read().decode("utf-8", "replace")
-        text = html_to_text(body) if "<" in body[:2000] else body
-        return text if len(text.strip()) > 200 else None
+        body = fetch(url, headers)
     except Exception:
-        return None
+        return None, None, []
+    is_html = "<" in body[:2000]
+    text = html_to_text(body) if is_html else body
+    links = find_code_links(body, url) if is_html else []
+    diff = None
+    for link in links[:5]:
+        cand = diff_url(link) or link
+        try:
+            d = fetch(cand, headers, timeout=60)
+            if re.search(r"^(diff --git|--- |\+\+\+ |@@ )", d, re.M):
+                diff = d
+                log(f"从问题单里的代码链接取到 diff:{cand}")
+                break
+        except Exception:
+            continue
+    if diff is None and re.search(r"^(diff --git|@@ )", text, re.M):
+        diff = text   # 页面正文本身贴了补丁
+    return (text if len(text.strip()) > 200 else None), diff, links
 
 
 def load_fix(fix):
@@ -192,6 +238,7 @@ def main(argv=None):
     ap.add_argument("--window", help="事故窗/用例执行时间,原样交给推导角当查询窗(如 \"2026-09-09 09:04–09:07 UTC+8\");不给则从题目目录 window.txt 读")
     ap.add_argument("--fix", help="修复来源:本地 diff 文件、GitHub/Gitee 的 PR / commit 链接,或问题单网页地址(如 DTS 单,修复代码在页面里)")
     ap.add_argument("--mcp-config", help="dbdog MCP 配置 JSON(显式挂;不给则继承 config dir 里已配的 MCP)")
+    ap.add_argument("--ticket-headers", help="抓问题单页面用的请求头文件(每行 Header: value,如 Cookie)")
     ap.add_argument("--source", help="被测版本内核源码树目录(代码路径核实用)")
     ap.add_argument("--out", help="输出目录")
     ap.add_argument("--config-dir", help="CLAUDE_CONFIG_DIR(选模型档)")
@@ -207,11 +254,13 @@ def main(argv=None):
         log(f"已在:{target}(--force 重跑)")
         return target
     ticket_url = fix if is_ticket_url(fix or "") else None
-    ticket_text = load_ticket(ticket_url) if ticket_url else None
-    fix_text = None if ticket_url else load_fix(fix)
+    ticket_text, fix_text, links = None, None, []
     if ticket_url:
-        log(f"修复来源是问题单网页:{ticket_url}(" + ("已抓成 ticket.txt" if ticket_text else "抓不到,交给推导角用 WebFetch 打开") + ")")
+        ticket_text, fix_text, links = load_ticket(ticket_url, a.ticket_headers)
+        log(f"修复来源是问题单网页:{ticket_url}(" + ("已抓成 ticket.txt" if ticket_text else "抓不到,交给推导角用 WebFetch 打开")
+            + (f";页面里 {len(links)} 个代码链接" if links else "") + (";已取到 diff" if fix_text else "") + ")")
     else:
+        fix_text = load_fix(fix)
         log("有修复 diff,先读 diff 再核源码" if fix_text else "无修复 diff,可信度按提示词规则降一档")
     if source and os.path.isdir(source):
         log(f"可读源码树:{source}")
@@ -223,7 +272,7 @@ def main(argv=None):
     claude_bin = find_claude()
     cfg = a.config_dir or os.environ.get("EVIDENCE_CONFIG_DIR") or None
     log(f"claude={claude_bin} · 模型档 {cfg or '<claude 默认>'} · 工作目录 {work}")
-    cmd = claude_command(read(PROMPT), claude_bin, a.mcp_config, allow_webfetch=bool(ticket_url and not ticket_text)) + (["--model", a.model] if a.model else [])
+    cmd = claude_command(read(PROMPT), claude_bin, a.mcp_config, allow_webfetch=bool(ticket_url and not fix_text)) + (["--model", a.model] if a.model else [])
     log("MCP:" + (a.mcp_config if a.mcp_config else "继承 config dir 已配的"))
     with open(os.path.join(work, "claude.stdout"), "w", encoding="utf-8") as so, \
          open(os.path.join(work, "claude.err"), "w", encoding="utf-8") as se:

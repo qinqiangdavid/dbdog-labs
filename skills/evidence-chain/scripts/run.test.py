@@ -48,6 +48,15 @@ class Inputs(unittest.TestCase):
         self.assertFalse(ec.is_ticket_url("/local/fix.diff"))
         self.assertIn("补丁", ec.html_to_text("<html><script>x()</script><body><h1>DTS-1</h1><p>补丁如下</p><pre>--- a</pre></body></html>"))
 
+    def test_code_links_and_headers(self):
+        html = '<a href="/o/r/commit/abc123">fix</a> <a href="https://gitee.com/o/r/pulls/9">pr</a> <a href="/x/y.diff">d</a> <a href="/o/r/commit/abc123">dup</a>'
+        self.assertEqual(ec.find_code_links(html, "https://dts.example.com/issue/1"),
+                         ["https://dts.example.com/o/r/commit/abc123", "https://gitee.com/o/r/pulls/9", "https://dts.example.com/x/y.diff"])
+        with tempfile.TemporaryDirectory() as d:
+            hf = os.path.join(d, "h.txt"); open(hf, "w").write("# 注释\nCookie: sid=abc\nX-Token: t\n")
+            h = ec.load_headers(hf)
+            self.assertEqual(h["Cookie"], "sid=abc"); self.assertEqual(h["X-Token"], "t"); self.assertIn("User-Agent", h)
+
     def test_ticket_in_case_md_and_webfetch(self):
         with tempfile.TemporaryDirectory() as d:
             p, g, f, src = self._files(d)
