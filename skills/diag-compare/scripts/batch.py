@@ -67,11 +67,11 @@ def aggregate(out_dir, cases):
         imp = ", ".join(f"{k}×{v}" for k, v in sorted(g["impacts"].items(), key=lambda kv: -kv[1]))
         fix = (g["fixes"][0] if g["fixes"] else "").replace("|", "\\|")
         lines.append(f"| {i} | {g['category']} | {str(g['title']).replace('|', '/')} | {g.get('tool') or ''} | {len(g['cases'])}:{','.join(g['cases'])} | {imp} | {fix} |")
-    lines += ["", "## 各单号总判", "", "| 单号 | agent 定住根因 | 反向 verdict | 主要在哪层 | 第一步走错 seq | 无工具 | 应有结果但没有 | 结果不对 | 假设没提到 | 工具没调或调错 | 调对了但推理错 |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines += ["", "## 各单号总判", "", "| 单号 | agent 定住根因 | 反向 verdict | 主要在哪层 | 第一步走错 seq | 无工具 | 应有结果但没有 | 结果不对 | 假设没提到 | 工具没调或调错 | 调对了但推理错 | 无问题 | 未调无碍 |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in per_case:
         k = c["counts"]
         lines.append(f"| {c['id']} | {'是' if c['pinned'] else '否'} | {c['reverse_verdict'] or ''} | {c['main_layer'] or ''} | {c['first_wrong_step'] or ''} | "
-                     + " | ".join(str(k.get(x, 0)) for x in ("无工具", "应有结果但没有", "结果不对", "假设没提到", "工具没调或调错", "调对了但推理错")) + " |")
+                     + " | ".join(str(k.get(x, 0)) for x in ("无工具", "应有结果但没有", "结果不对", "假设没提到", "工具没调或调错", "调对了但推理错", "无问题", "未调无碍")) + " |")
     lines += ["", "## 按类别", ""]
     for cat in CATS:
         items = [g for g in ranked if g["category"] == cat]
