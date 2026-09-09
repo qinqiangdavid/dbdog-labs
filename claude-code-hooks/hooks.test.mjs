@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { hypothesisTags, parseIntent } from "./hypothesis.mjs";
+import { scanSpans } from "./lib.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -827,6 +828,34 @@ async function startSpanSink() {
   };
 }
 
+/** 先收 acceptBatches 批（202），之后一律 500——模拟慢链路上「前几批成功、后面超时」。 */
+async function startFlakySink(acceptBatches) {
+  const received = [];
+  let posts = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      posts++;
+      if (posts <= acceptBatches) {
+        try {
+          received.push(...(JSON.parse(body).spans ?? []));
+        } catch {
+          /* ignore */
+        }
+        res.writeHead(202, { "content-type": "application/json" });
+      } else res.writeHead(500);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`,
+    received,
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
 /**
  * 异步跑脚本——必须异步：sweep 会 POST 到本测试进程内起的 sink server，
  * 用 spawnSync 会阻塞 vitest 的事件循环，server 根本没机会响应，
@@ -1006,6 +1035,76 @@ describe("sweep: 补发卡死的 pending", () => {
 
     expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["aaaa"]);
     expect(fs.existsSync(p), "上报失败不得删文件").toBe(true);
+  });
+});
+
+describe("sweep: 分批落盘进度", () => {
+  it("前几批成功、后面失败：已送达的 id 立即从 pending 去掉，下次只重发剩下的", async () => {
+    // 2026-09-08 之前「一批失败就整体留着」：前面成功的批次下次原样重发，慢链路上每轮
+    // 都从头撞，永远收敛不了。现在每批成功就把进度写回状态文件。
+    const dir = tempObsDir();
+    const sink = await startFlakySink(1);
+    try {
+      const ids = ["s1", "s2", "s3", "s4"];
+      fs.writeFileSync(
+        path.join(dir, "spans.jsonl"),
+        ids.map((id) => JSON.stringify({ trace_id: "t", span_id: id, kind: "llm", name: id })).join("\n") + "\n",
+      );
+      const p = writeStateFile(dir, "slow.json", { trace_id: "t", pending_spans: ids });
+      ageFile(p, 3 * HOUR);
+
+      await runScript("sweep.mjs", dir, {
+        DBDOG_OBS_REPORT_URL: sink.url,
+        DBDOG_OBS_API_KEY: "k",
+        DBDOG_OBS_SWEEP_IDLE_MS: String(HOUR),
+        DBDOG_OBS_SWEEP_BATCH: "2",
+      });
+
+      expect(sink.received.map((s) => s.span_id)).toEqual(["s1", "s2"]);
+      expect(JSON.parse(fs.readFileSync(p, "utf8")).pending_spans).toEqual(["s3", "s4"]);
+      expect(fs.existsSync(p), "没排空不得删文件").toBe(true);
+    } finally {
+      await sink.close();
+    }
+  });
+});
+
+describe("spans.jsonl 流式扫描（不整文件读进内存）", () => {
+  // 实测本地 spans.jsonl 376MB：三处 readFileSync 全量读 + split 让 sweep 常驻 2GB、跑 57s；
+  // 再涨到 Node 字符串上限（约 5 亿字符）readFileSync 直接抛，hook 吞错后补发与总结静默失效。
+  it("scanSpans 逐行回调，容忍脏行与无换行收尾的末行", async () => {
+    const dir = tempObsDir();
+    const spansFile = path.join(dir, "spans.jsonl");
+    fs.writeFileSync(
+      spansFile,
+      [
+        JSON.stringify({ trace_id: "t", span_id: "a", kind: "llm" }),
+        "{not json",
+        "",
+        JSON.stringify({ trace_id: "t", span_id: "b", kind: "tool" }),
+        JSON.stringify({ trace_id: "t", span_id: "a", kind: "llm", name: "rewritten" }),
+      ].join("\n"), // 末行故意不带 \n
+    );
+    process.env.DBDOG_OBS_SPANS = spansFile;
+    try {
+      const seen = [];
+      await scanSpans((span) => seen.push(span));
+      expect(seen.map((s) => s.span_id)).toEqual(["a", "b", "a"]);
+      expect(seen[2].name).toBe("rewritten");
+    } finally {
+      delete process.env.DBDOG_OBS_SPANS;
+    }
+  });
+
+  it("文件不存在 → 一次都不回调、不抛", async () => {
+    process.env.DBDOG_OBS_SPANS = path.join(tempObsDir(), "missing.jsonl");
+    try {
+      let n = 0;
+      await scanSpans(() => n++);
+      expect(n).toBe(0);
+    } finally {
+      delete process.env.DBDOG_OBS_SPANS;
+    }
   });
 });
 
