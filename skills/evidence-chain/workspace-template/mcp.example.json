@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "dbdog": {
+      "type": "http",
+      "url": "http://<dbdog-mcp 地址>:8090/mcp?toolsets=core,dbm,ddsql,profiling&skillsets=core,dbm,code,ddsql,profiling&databases=opengauss",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}

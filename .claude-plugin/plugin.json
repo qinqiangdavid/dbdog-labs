@@ -1,5 +1,5 @@
 {
   "name": "dbdog-agent-obs",
-  "version": "0.5.1",
-  "description": "dbdog Agent Observability client hooks for Claude Code（mint → propagate → synthesize → sweep；子代理内部调用可见，span 树三层。脚本本体在 claude-code-hooks/，hooks/hooks.json 经 ${CLAUDE_PLUGIN_ROOT} 引用；另带 skill diag-pair：正向（hook span → 假设图 markdown）/ 反向（根因+源码 → 应有证据链 markdown），见 skills/diag-pair/SKILL.md）"
+  "version": "0.6.0",
+  "description": "dbdog Agent Observability client hooks for Claude Code（mint → propagate → synthesize → sweep；子代理内部调用可见，span 树三层。脚本本体在 claude-code-hooks/，hooks/hooks.json 经 ${CLAUDE_PLUGIN_ROOT} 引用；另带两个 skill：span-graph（hook span → 假设图 markdown,零模型）、evidence-chain（现象+根因+修复 diff+源码树 → 应有证据链与 dbdog 工具缺口 markdown），见 skills/*/SKILL.md）"
 }

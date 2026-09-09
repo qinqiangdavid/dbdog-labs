@@ -58,7 +58,8 @@ LLM Observability · Traces 刷新，应看到完整的树（根 🌳 + 推理 �
 .claude-plugin/     marketplace.json + plugin.json（插件安装通道）
 hooks/hooks.json    插件 hooks 定义（${CLAUDE_PLUGIN_ROOT} 引用脚本）
 claude-code-hooks/  脚本本体 + 研发 README（含手动接线的历史方式与自检命令）
-skills/diag-pair/   diag-pair skill：正向（hook span → 假设图）/ 反向（根因 + 源码树 → 应有证据链），两份 markdown 供对比分析；入口 scripts/run_pair.py，跨平台
+skills/span-graph/     span-graph skill：hook span → 假设图 markdown（零模型），入口 scripts/from_spans.py
+skills/evidence-chain/ evidence-chain skill：现象 + 根因 + 修复 diff + 源码树 → 应有证据链与 dbdog 工具缺口 markdown，入口 scripts/run.py（调 claude -p）
 ```
 
 母版历史：2026-07-14 从 dbdog-mcp `clients/claude-code-hooks/` 迁入并固定于此。
