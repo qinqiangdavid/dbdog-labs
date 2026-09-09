@@ -105,8 +105,11 @@ class Manifest(unittest.TestCase):
             self.assertIn("--work", open(os.path.join(c1, "dry-run.txt"), encoding="utf-8").read())
 
     def test_diag_prompt_and_env(self):
-        pr = b.build_diag_prompt("诊断: {{WINDOW}}(UTC+8),bench 库慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "【假设书写约定】...")
-        self.assertTrue(pr.startswith("诊断: 2026-09-09 09:04–09:07 (UTC+8)(UTC+8),bench 库慢"))
+        pr = b.build_diag_prompt("## OG-1 复现用例\n\n诊断: {{WINDOW}}(UTC+8),bench 库慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "【假设书写约定】...")
+        self.assertTrue(pr.startswith("诊断: 2026-09-09 09:04–09:07(UTC+8),bench 库慢"), pr[:80])
+        self.assertNotIn("复现用例", pr)
+        pr2 = b.build_diag_prompt("题面 {{WINDOW}} 慢", "2026-09-09 09:04–09:07 (UTC+8),实例 x", "R")
+        self.assertTrue(pr2.startswith("诊断: 题面 2026-09-09 09:04–09:07 (UTC+8) 慢"))
         self.assertIn("【假设书写约定】", pr)
         self.assertTrue(b.build_diag_prompt("bench 库慢", "", "R").startswith("诊断: bench 库慢"))
         env = b.diag_env({"PATH": "/bin"}, "/out/OG-1", "OG-1", "/cfg")
@@ -116,6 +119,7 @@ class Manifest(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg")
         deny = b.diag_settings("/out")["permissions"]["deny"]
         self.assertIn("Read(///out/**)", deny)
+        self.assertFalse(any(x.startswith(("Grep(", "Glob(")) for x in deny))
 
     def test_stage_plan(self):
         with tempfile.TemporaryDirectory() as d:

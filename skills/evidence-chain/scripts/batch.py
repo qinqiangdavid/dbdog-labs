@@ -118,9 +118,16 @@ def fix_kind(fix):
 
 def build_diag_prompt(phenomenon, window, rules_text):
     """正向诊断的完整提示词 = 「诊断:」+ 题面({{WINDOW}} 用事故窗的时间段替换)+ 假设书写约定(hook 按它打 tag,缺了正向图就空)。"""
-    p = phenomenon.strip()
+    # 切出来的小节可能带 markdown 标题行(## 用例号 …),那是文件组织,不是题面,去掉
+    lines = [l for l in phenomenon.strip().splitlines()]
+    while lines and re.match(r"^#+\s", lines[0]):
+        lines.pop(0)
+    p = "\n".join(lines).strip()
     if window:
-        p = p.replace("{{WINDOW}}", window.split(",")[0].strip())
+        head = window.split(",")[0].strip()
+        bare = re.sub(r"\s*\(UTC[^)]*\)\s*$", "", head)
+        p = re.sub(r"\{\{WINDOW\}\}(?=\s*\(UTC)", bare, p)   # 题面自带 (UTC+8) 就不重复
+        p = p.replace("{{WINDOW}}", head)
     if not re.match(r"^\s*(诊断|diag)\s*[:：]", p, re.I):
         p = "诊断: " + p
     return p + "\n\n" + rules_text.strip() + "\n"
@@ -141,8 +148,8 @@ def diag_env(base, cdir, case_id, config_dir=None):
 def diag_settings(out_dir):
     """诊断会话对答案盲:禁读整个输出目录(root-cause.md / evidence-chain.md 都在里面)与联网。"""
     root = os.path.abspath(out_dir).replace("\\", "/")
-    pats = [f"{t}(//{root}/**)" for t in ("Read", "Grep", "Glob")]
-    return {"permissions": {"deny": ["WebSearch", "WebFetch", *pats, "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(scp:*)"]}}
+    # Claude Code 只按 Read(path) 规则做文件权限检查(它覆盖所有读文件的工具,含 Grep/Glob);Grep()/Glob() 写了也不生效
+    return {"permissions": {"deny": ["WebSearch", "WebFetch", f"Read(//{root}/**)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(scp:*)"]}}
 
 
 def diagnose(cid, cdir, phenomenon, window, st, absp):
