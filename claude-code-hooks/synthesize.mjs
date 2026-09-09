@@ -3,6 +3,7 @@
 // 与 session-end.mjs（会话直接结束的收尾）共用——此前 stop.mjs 顶层就执行 run()，
 // 无法被 import 复用，只能整段搬家。
 import fs from "node:fs";
+import { hypothesisTags } from "./hypothesis.mjs";
 import { cap, contentCap, ctxBufCap, deriveSpanId, storeLlmInput } from "./lib.mjs";
 
 /**
@@ -71,6 +72,16 @@ export const PENDING_TOOL_USE_MAX = 200;
 
 /** 起子代理的工具名（父侧那一次调用，其 tool_result 携带 toolUseResult.agentId）。 */
 export const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+
+const LAUNCHED_AGENT_ID = /(?:^|\n)\s*agentId:\s*([A-Za-z0-9_-]+)/;
+
+/** 父侧 Agent/Task 返回里的子代理 id：结构化 toolUseResult 优先，否则扫返回体那一行。 */
+export function extractLaunchedAgentId(toolUseResult, resultContent) {
+  const structured = typeof toolUseResult?.agentId === "string" ? toolUseResult.agentId.trim() : "";
+  if (structured) return structured;
+  const m = LAUNCHED_AGENT_ID.exec(toolResultText(resultContent));
+  return m?.[1] ?? null;
+}
 
 /**
  * 从 transcript 新增行合成 llm + tool span。
@@ -214,8 +225,10 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
         // 父侧起子代理的那次调用：span_id 不能随机，必须与 SubagentStop 侧算出同一个值——
         // 子代理的 span 早在这一行落盘之前就写出去了，只能靠 (trace_id, agent_id) 派生对齐。
         // 加 "tool:" 前缀是为了跟子代理自己的 agent span 区分开（两者都由 agent_id 派生）。
+        // Claude Code 2.1+ 后台派发：toolUseResult 常为空，agentId 写在返回体
+        // 「agentId: <id>」那一行（L2 全是这种）。结构化字段仍优先。
         const result = SUBAGENT_TOOLS.has(use.name) ? entry.toolUseResult : null;
-        const subAgentId = result?.agentId ?? null;
+        const subAgentId = extractLaunchedAgentId(result, b.content);
         // 普通工具也走派生（锚 tool_use_id，全局唯一且在 transcript 里就有）：
         // 随机 id 会让"同一批行被合成两遍"变成两条不同键的 span，读侧折不掉。
         const spanId = subAgentId
@@ -228,12 +241,12 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
         const subAgentTags = subAgentId
           ? {
               agent_id: subAgentId,
-              ...(result.agentType ? { agent_type: result.agentType } : {}),
-              ...(result.resolvedModel ? { agent_model: result.resolvedModel } : {}),
-              ...(Number.isFinite(result.totalTokens)
+              ...(result?.agentType ? { agent_type: result.agentType } : {}),
+              ...(result?.resolvedModel ? { agent_model: result.resolvedModel } : {}),
+              ...(Number.isFinite(result?.totalTokens)
                 ? { agent_total_tokens: String(result.totalTokens) }
                 : {}),
-              ...(Number.isFinite(result.totalToolUseCount)
+              ...(Number.isFinite(result?.totalToolUseCount)
                 ? { agent_tool_use_count: String(result.totalToolUseCount) }
                 : {}),
             }
@@ -261,6 +274,7 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
             sidechain: use.sidechain,
             ...(mlApp ? { ml_app: mlApp } : {}),
             ...(use.mcp_server ? { mcp_server: use.mcp_server } : {}),
+            ...hypothesisTags(use.intent),
             ...agentTags,
             ...subAgentTags,
           },

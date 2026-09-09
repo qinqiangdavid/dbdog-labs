@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { hypothesisTags, parseIntent } from "./hypothesis.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -46,6 +47,20 @@ function runHook(script, input, obsDir, extraEnv = {}) {
 function readState(obsDir, sessionId) {
   return JSON.parse(fs.readFileSync(path.join(obsDir, sessionId + ".json"), "utf8"));
 }
+
+describe("hypothesis intent tags", () => {
+  it("parses formatted intent into span tags", () => {
+    const tags = hypothesisTags("[H1] 类型=现象确认; 假设=能锚定实例");
+    expect(parseIntent("[H1] 类型=现象确认; 假设=能锚定实例")?.type).toBe("confirm");
+    expect(tags.hypothesis_id).toBe("H1");
+    expect(tags.hypothesis_type).toBe("confirm");
+    expect(tags.hypothesis).toBe("能锚定实例");
+  });
+
+  it("leaves unformatted intent untagged", () => {
+    expect(hypothesisTags("look up trace")).toEqual({});
+  });
+});
 
 describe("Agent Obs hook trigger", () => {
   it("does not create trace state for an ordinary prompt in triggered mode", () => {
@@ -644,6 +659,83 @@ describe("subagent path tracing", () => {
     // 子代理内部的调用挂子代理自己的 agent span，不再直接挂父侧 tool span
     expect(bash.parent_id).toBe(subAgent.span_id);
     expect(subLlm.parent_id).toBe(subAgent.span_id);
+  });
+
+  it("nests L2 when Agent tool_result only has agentId in the async-launch text", () => {
+    // Claude Code 2.1+ 后台派发：toolUseResult 为空，agentId 写在返回体正文。
+    const dir = tempObsDir();
+    const main = writeTranscript(dir, "main-async.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 起个子代理" } },
+      {
+        type: "assistant",
+        timestamp: T("01.000"),
+        requestId: "req_main",
+        message: {
+          model: "claude-opus-5",
+          usage: { input_tokens: 1, output_tokens: 2 },
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent",
+              name: "Agent",
+              input: { description: "L2 取证", prompt: "跑 echo" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        timestamp: T("01.100"),
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_agent",
+              content: [
+                {
+                  type: "text",
+                  text:
+                    "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\n" +
+                    `agentId: ${AGENT_ID} (internal ID - do not mention to user. Use SendMessage with to: '${AGENT_ID}')\n` +
+                    "The agent is working in the background.",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ]);
+    const sub = writeSubagentTranscript(dir);
+    seedState(dir, "s-async", main);
+
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "s-async",
+        transcript_path: main,
+        agent_transcript_path: sub,
+        agent_id: AGENT_ID,
+        agent_type: "general-purpose",
+        hook_event_name: "SubagentStop",
+        last_assistant_message: "stdout 是 hi",
+      },
+      dir,
+    );
+    runHook(
+      "stop.mjs",
+      { session_id: "s-async", transcript_path: main, hook_event_name: "Stop", last_assistant_message: "done" },
+      dir,
+    );
+
+    const spans = readSpans(dir);
+    const root = spans.find((s) => s.kind === "agent" && s.name === "claude-code.task");
+    const agentTool = spans.find((s) => s.kind === "tool" && s.name === "Agent");
+    const subAgent = spans.find((s) => s.kind === "agent" && s.name === "claude-code.subagent");
+    expect(agentTool, "父侧 Agent 调用应有 tool span").toBeDefined();
+    expect(agentTool.tags.agent_id).toBe(AGENT_ID);
+    expect(agentTool.parent_id).toBe(root.span_id);
+    expect(subAgent.parent_id).toBe(agentTool.span_id);
   });
 
   it("stays a no-op when SubagentStop carries no agent_transcript_path", () => {
